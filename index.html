@@ -1,0 +1,1157 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+<title>Budget Vocal</title>
+<meta name="theme-color" content="#16302B" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Budget Vocal" />
+<link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%2316302B'/%3E%3Ctext x='50' y='68' font-size='52' text-anchor='middle'%3E%F0%9F%8E%99%EF%B8%8F%3C/text%3E%3C/svg%3E" />
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>html,body{margin:0;padding:0;background:#EDF1EB}#root{min-height:100vh}</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+/* Sauvegarde locale : remplace le stockage Claude par le stockage du téléphone */
+window.storage = {
+  async get(k){ const v = localStorage.getItem("bv:"+k); if(v==null) throw new Error("not found"); return {key:k, value:v}; },
+  async set(k,v){ localStorage.setItem("bv:"+k, v); return {key:k, value:v}; },
+  async delete(k){ localStorage.removeItem("bv:"+k); return {key:k, deleted:true}; },
+  async list(){ return {keys:Object.keys(localStorage).filter(x=>x.startsWith("bv:")).map(x=>x.slice(3))}; }
+};
+</script>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useCallback } = React;
+
+
+/* ─────────────────────────────────────────────
+   BUDGET VOCAL v2 — budget à la voix
+   + Centre de notifications-conseils
+   + Onglet Bons plans (enseignes & cashback)
+   + Vocal réparé : dictée iPhone en repli auto
+   ───────────────────────────────────────────── */
+
+const C = {
+  paper: "#EDF1EB",
+  card: "#FFFFFF",
+  ink: "#16302B",
+  inkSoft: "#5A6E68",
+  expense: "#B23A2A",
+  income: "#2F7D5B",
+  line: "#D4DCD3",
+  micGlow: "#9FD3B8",
+  alert: "#B98A1E",
+};
+
+const FONT_DISPLAY = "'Space Grotesk', system-ui, sans-serif";
+const FONT_MONO = "'IBM Plex Mono', ui-monospace, monospace";
+
+const CATEGORIES = {
+  Alimentation: ["courses", "course", "supermarché", "supermarche", "carrefour", "leclerc", "lidl", "aldi", "auchan", "monoprix", "franprix", "intermarché", "boulangerie", "pain", "marché", "marche", "épicerie", "epicerie", "primeur", "boucherie", "pâtisserie", "patisserie"],
+  "Café & Resto": ["restaurant", "resto", "café", "cafe", "kebab", "mcdo", "mcdonald", "burger", "pizza", "sushi", "déjeuner", "dejeuner", "dîner", "diner", "sandwich", "tacos", "brasserie", "bar"],
+  Transport: ["essence", "carburant", "gasoil", "diesel", "métro", "metro", "navigo", "ticket", "bus", "train", "sncf", "uber", "taxi", "vtc", "parking", "péage", "peage", "vélib", "velib", "trottinette"],
+  Logement: ["loyer", "edf", "électricité", "electricite", "gaz", "eau", "internet", "box", "charges", "assurance habitation", "engie"],
+  Santé: ["pharmacie", "médecin", "medecin", "docteur", "dentiste", "mutuelle", "médicament", "medicament", "kiné", "kine", "opticien", "lunettes"],
+  Abonnements: ["netflix", "spotify", "abonnement", "forfait", "mobile", "canal", "prime", "disney", "deezer", "icloud"],
+  Loisirs: ["cinéma", "cinema", "ciné", "cine", "jeu", "jeux", "sport", "salle", "concert", "sortie", "livre", "musée", "musee", "piscine"],
+  Shopping: ["vêtement", "vetement", "vêtements", "vetements", "chaussures", "zara", "amazon", "fnac", "cadeau", "décathlon", "decathlon", "ikea"],
+};
+
+const INCOME_WORDS = ["salaire", "paie", "paye", "prime", "revenu", "virement", "remboursement", "acompte", "freelance", "facture payée", "facture payee"];
+
+const CAT_ICONS = {
+  Alimentation: "🛒", "Café & Resto": "🍽️", Transport: "🚇", Logement: "🏠",
+  Santé: "💊", Abonnements: "📱", Loisirs: "🎬", Shopping: "🛍️", Autre: "📦", Revenu: "💶",
+};
+
+/* ── Conseil du jour (rotation quotidienne) ── */
+const DAILY_TIPS = [
+  { icon: "📅", title: "Nouveau catalogue Lidl", body: "Les promos Lidl changent chaque semaine et le catalogue suivant est en ligne dès le mercredi. Repère les offres avant de faire tes courses via l'app Lidl Plus." },
+  { icon: "🧾", title: "Scanne tes tickets", body: "Shopmium et Quoty remboursent une partie de tes courses sur simple photo du ticket de caisse. Jusqu'à 40–60 €/mois récupérés pour une famille." },
+  { icon: "💳", title: "Cashback automatique", body: "Joko se connecte à ta carte bancaire et te reverse du cashback sans rien faire, en magasin comme en ligne. À activer une fois, ça travaille tout seul." },
+  { icon: "🥖", title: "Panier anti-gaspi", body: "Too Good To Go : paniers boulangerie/primeur à −60/70 % en fin de journée. Parfait pour le goûter des enfants." },
+  { icon: "🛒", title: "Drive plutôt que magasin", body: "Commander en drive évite les achats impulsifs (souvent 15–20 % du ticket). Et tu peux passer par iGraal/Poulpeo pour du cashback sur le drive." },
+  { icon: "🏷️", title: "Marques distributeur", body: "Marque Repère (Leclerc), produits Lidl, Labell (Intermarché) : mêmes usines, 25–30 % moins cher que les grandes marques sur les basiques." },
+  { icon: "🍲", title: "Batch cooking dimanche", body: "Cuisiner 4–5 repas d'avance le dimanche réduit plats préparés et livraisons : 100–150 €/mois d'économie pour un foyer de 5." },
+  { icon: "⚖️", title: "Compare au prix/kilo", body: "En rayon, ignore le prix affiché, compare le prix au kilo/litre en petit sur l'étiquette. Les formats \"familiaux\" ne sont pas toujours les moins chers." },
+  { icon: "📆", title: "Fais tes courses le mercredi", body: "Nouveaux catalogues + rayons réapprovisionnés + stickers anti-gaspi en matinée : le mercredi matin est le meilleur créneau promo." },
+  { icon: "📉", title: "Traque tes abonnements", body: "Ouvre le rapport mensuel et regarde la catégorie Abonnements : un doublon streaming ou un forfait mal négocié = 20–40 €/mois qui dorment." },
+];
+
+/* ── Bons plans (onglet dédié) ── */
+const DEALS = [
+  {
+    section: "🛒 Enseignes — où acheter quoi",
+    items: [
+      { t: "Lidl / Aldi", d: "Base des courses : épicerie, hygiène, produits frais. Catalogue hebdo avec promos jusqu'à −50 %, nouveau prospectus en ligne dès le mercredi. Active Lidl Plus pour les coupons perso." },
+      { t: "Leclerc", d: "Le moins cher des hypers pour le complément (grandes marques en promo, carburant à prix coûtant). Marque Repère pour les basiques. Passe par le drive + cashback." },
+      { t: "Marchés parisiens (fin de matinée)", d: "Fruits & légumes bradés à la fermeture (vers 13h). Marché de Grenelle et Convention dans le 15e." },
+      { t: "Anti-crise.fr / catalogues en ligne", d: "Tous les prospectus (Lidl, Leclerc, Carrefour, Auchan, Intermarché…) au même endroit pour comparer les promos de la semaine avant de choisir l'enseigne." },
+    ],
+  },
+  {
+    section: "💰 Cashback — récupérer de l'argent",
+    items: [
+      { t: "Joko", d: "Cashback 100 % automatique connecté à la carte bancaire, en magasin et en ligne. Zéro effort." },
+      { t: "Shopmium + Quoty", d: "Photo du ticket de caisse → remboursement sur des produits sélectionnés (grandes marques). Cumulable avec les promos magasin." },
+      { t: "iGraal / Poulpeo", d: "Cashback sur les achats en ligne et les drives (Carrefour, Auchan, Cdiscount…). Poulpeo : retrait dès 10 €." },
+      { t: "Le combo gagnant", d: "Promo catalogue + paiement via bon d'achat + scan du ticket sur Shopmium : jusqu'à 300–400 €/an récupérés sans changer ses habitudes." },
+    ],
+  },
+  {
+    section: "🥕 Anti-gaspi & malin",
+    items: [
+      { t: "Too Good To Go", d: "Paniers surprise à −60/70 % chez les commerçants du quartier en fin de journée." },
+      { t: "Stickers −30/−50 %", d: "Rayons frais tôt le matin : produits à DLC courte parfaits pour le batch cooking du jour même." },
+      { t: "Congélateur = allié", d: "Acheter la viande/le pain en grosse promo et congeler en portions. Gros levier pour une famille de 5." },
+    ],
+  },
+  {
+    section: "👨‍👩‍👧‍👦 Spécial famille",
+    items: [
+      { t: "Forfait mobile groupé", d: "5 lignes B&You / RED / Free : 40–60 €/mois au total au lieu de 100+ en lignes séparées." },
+      { t: "Streaming en famille", d: "Spotify Famille ≈ 18 €/mois pour 6 comptes. Couper les doublons Netflix/Disney selon les mois." },
+      { t: "Étudiants (20 & 22 ans)", d: "Resto U à 1 € (boursiers), Imagine R Étudiant, carte SNCF Avantage Jeune, bourse CROUS + APL à vérifier." },
+      { t: "Collégien (13 ans)", d: "Imagine R Scolaire (~28 €/mois), Allocation de Rentrée Scolaire (CAF) fin août, Pass Culture dès 15 ans à anticiper." },
+    ],
+  },
+  {
+    section: "👕 Habillement",
+    items: [
+      { t: "Vinted & seconde main", d: "Le réflexe n°1 pour les enfants qui grandissent vite : vêtements à −70/80 %, et revends ce qui ne va plus — le vestiaire tourne presque à coût nul." },
+      { t: "Soldes & ventes privées", d: "Deux périodes légales (janvier et fin juin-juillet) pour les grosses pièces (manteaux, chaussures). Entre les deux : Veepee et Showroomprivé pour les marques à −50/70 %." },
+      { t: "Outlets autour de Paris", d: "One Nation (Les Clayes), McArthurGlen, Usines Center : marques dégriffées −30/70 % toute l'année. Y aller avec une liste, pas en balade." },
+      { t: "La base au juste prix", d: "Kiabi, Decathlon et les rayons textile Lidl/Action pour les basiques et le sport — inutile de payer une marque pour un tee-shirt de collège." },
+    ],
+  },
+  {
+    section: "💻 Électronique & informatique",
+    items: [
+      { t: "Reconditionné d'abord", d: "Back Market, Recommerce, ou le rayon reconditionné Amazon/Fnac : téléphones et ordis −30 à −60 % avec 12-24 mois de garantie. Pour les ados, c'est le réflexe par défaut." },
+      { t: "Tarifs éducation (20 & 22 ans)", d: "S'ils sont étudiants : Apple et Microsoft Éducation (−10 % + offres rentrée), suites Adobe/Office étudiantes, et Unidays/Student Beans pour des dizaines de réductions vérifiées." },
+      { t: "Dealabs pour acheter au bon moment", d: "Crée une alerte sur le produit visé : la communauté signale le vrai prix plancher. Évite d'acheter hors des promos signalées, surtout hors Black Friday/soldes." },
+      { t: "Garantie légale = 2 ans gratuits", d: "Toute extension de garantie payante en caisse fait double emploi avec la garantie légale de conformité de 2 ans. Refuse poliment, c'est de l'argent économisé à chaque achat." },
+    ],
+  },
+  {
+    section: "🎢 Sorties & loisirs",
+    items: [
+      { t: "Musées : quasi gratuits pour vous 5", d: "Collections permanentes des musées nationaux gratuites pour les -26 ans résidents UE (vos 3 enfants !) et pour tous le 1er dimanche du mois dans beaucoup de musées. Il ne reste que 2 billets adultes à payer." },
+      { t: "Cinéma malin", d: "Fête du Cinéma (fin juin) et Printemps du Cinéma (mars) à ~5 € la séance, séances du matin à tarif réduit, et cartes UGC/CGR si vous y allez souvent." },
+      { t: "CE Ponticelli", d: "Ta billetterie CE (parcs d'attractions, cinéma, spectacles, piscines) est souvent à −20/50 % — le réflexe à prendre AVANT tout achat de sortie familiale." },
+      { t: "Pass Culture & gratuité Paris", d: "Pass Culture : 50 € à 17 ans puis 150 € à 18 ans pour le collégien plus tard. Et Paris regorge de gratuit : bibliothèques, parcs, Paris Plages, Nuit Blanche, fêtes de quartier du 15e." },
+    ],
+  },
+  {
+    section: "🍽️ Restos",
+    items: [
+      { t: "TheFork (LaFourchette)", d: "Réserve via l'app : −30 à −50 % sur l'addition dans des milliers de restos parisiens + programme de fidélité Yums. À 5, la remise change tout." },
+      { t: "Formule midi plutôt que soir", d: "Le même resto coûte souvent 30-40 % de moins le midi. Pour les sorties famille, vise le déjeuner du samedi plutôt que le dîner." },
+      { t: "Apps de fastfood", d: "Les coupons des apps McDo/Burger King/KFC divisent régulièrement l'addition par deux pour les ados — toujours commander via l'app, jamais en caisse." },
+      { t: "Anniversaires & fidélité", d: "Beaucoup de chaînes offrent menu ou dessert le jour de l'anniversaire via leur programme (inscris les 5 dates). Et Too Good To Go marche aussi pour traiteurs et restos." },
+    ],
+  },
+  {
+    section: "✈️ Voyages",
+    items: [
+      { t: "Cartes SNCF adaptées à chacun", d: "Carte Avantage Adulte (49 €/an : −30 % titulaire + enfants −60 %) rentabilisée en 1-2 trajets, Avantage Jeune pour les 20 et 22 ans, et Ouigo réservé tôt pour les prix planchers." },
+      { t: "Aides vacances CAF (VACAF)", d: "Selon ton quotient familial, la CAF peut financer une partie d'un séjour en village vacances agréé ou d'une colonie pour le collégien. Vérifie ton droit sur caf.fr — très sous-utilisé." },
+      { t: "Vols : alertes + flexibilité", d: "Google Flights avec alertes prix, réservation 2-4 mois à l'avance pour les vacances scolaires, et compare les aéroports (Orly vs Roissy vs Beauvais). Bagage cabine seul à 5 = souvent 150-250 € économisés." },
+      { t: "Hébergement famille de 5", d: "À 5, l'appart (Airbnb/appart-hôtel avec cuisine) bat presque toujours 2 chambres d'hôtel — et cuisiner 1 repas/jour sur place réduit le budget vacances de 30 %. HomeExchange (échange de maisons) peut le réduire à quasi zéro." },
+    ],
+  },
+];
+
+/* ── Utilitaires dates ── */
+const dayKey = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+const monthKey = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+const weekStart = (d) => { const x = new Date(d); const dow = (x.getDay() + 6) % 7; x.setDate(x.getDate() - dow); x.setHours(0, 0, 0, 0); return x; };
+const weekKey = (d) => dayKey(weekStart(d));
+const isLastDayOfMonth = (d) => { const n = new Date(d); n.setDate(n.getDate() + 1); return n.getDate() === 1; };
+const fmt = (n) => n.toLocaleString("fr-FR", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + " €";
+const fmtDate = (d) => d.toLocaleDateString("fr-FR", { weekday: "long", day: "numeric", month: "long" });
+
+/* ── Parsing (vocal ou dictée) ── */
+function parseUtterance(raw) {
+  const text = raw.toLowerCase().trim();
+  const numMatch = text.match(/(\d+(?:[.,]\d{1,2})?)/);
+  const amount = numMatch ? parseFloat(numMatch[1].replace(",", ".")) : null;
+  let label = text
+    .replace(numMatch ? numMatch[0] : "", "")
+    .replace(/euros?|€|centimes?/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const isIncome = INCOME_WORDS.some((w) => text.includes(w));
+  let category = "Autre";
+  if (isIncome) category = "Revenu";
+  else {
+    for (const [cat, words] of Object.entries(CATEGORIES)) {
+      if (words.some((w) => text.includes(w))) { category = cat; break; }
+    }
+  }
+  if (!label) label = isIncome ? "salaire" : "dépense";
+  return { label: label.charAt(0).toUpperCase() + label.slice(1), amount, category, type: isIncome ? "income" : "expense" };
+}
+
+/* ── Stockage ── */
+const STORE_KEY = "budget-vocal-v1";
+async function loadData() {
+  try {
+    const r = await window.storage.get(STORE_KEY);
+    return r ? JSON.parse(r.value) : { entries: [], seen: {} };
+  } catch { return { entries: [], seen: {} }; }
+}
+async function saveData(data) {
+  try { await window.storage.set(STORE_KEY, JSON.stringify(data)); } catch (e) { console.error("save", e); }
+}
+
+/* ── Agrégations ── */
+const inDay = (e, d) => dayKey(new Date(e.ts)) === dayKey(d);
+const inWeek = (e, d) => { const s = weekStart(d).getTime(); const end = s + 7 * 864e5; return e.ts >= s && e.ts < end; };
+const inMonth = (e, d) => monthKey(new Date(e.ts)) === monthKey(d);
+const sum = (arr) => arr.reduce((a, e) => a + e.amount, 0);
+function byCategory(entries) {
+  const m = {};
+  for (const e of entries) m[e.category] = (m[e.category] || 0) + e.amount;
+  return Object.entries(m).sort((a, b) => b[1] - a[1]);
+}
+
+/* ── Notifications intelligentes du jour ── */
+function genNotifications(data, now) {
+  const notifs = [];
+  const entries = data.entries || [];
+  const dom = now.getDate();
+
+  // 0. Abonnements : rappels de résiliation et prélèvements imminents
+  for (const s of (data.subs || [])) {
+    if (s.status === "resilier") {
+      const daysLeft = s.cancelBy ? Math.ceil((new Date(s.cancelBy + "T12:00") - now) / 864e5) : null;
+      notifs.push({
+        id: "cancel-" + s.id, icon: "✂️", tone: C.expense,
+        title: `À résilier : ${s.name}`,
+        body: daysLeft != null
+          ? (daysLeft <= 0 ? `L'échéance est dépassée ! Résilie vite pour éviter le prochain prélèvement de ${fmt(s.amount)}.` : `${daysLeft} jour${daysLeft > 1 ? "s" : ""} avant l'échéance. Économie à la clé : ${fmt(s.period === "an" ? s.amount : s.amount * 12)}/an.`)
+          : `Économie à la clé : ${fmt(s.period === "an" ? s.amount : s.amount * 12)}/an. Fixe une date limite dans l'onglet Abonnements.`,
+      });
+    } else if (s.day && s.period === "mois") {
+      const diff = s.day - dom;
+      if (diff === 0 || diff === 1) {
+        notifs.push({
+          id: "bill-" + s.id, icon: "📅", tone: C.alert,
+          title: `${s.name} : prélèvement ${diff === 0 ? "aujourd'hui" : "demain"}`,
+          body: `${fmt(s.amount)} sur ${s.email || "ta carte"}. Toujours utile ? Sinon, marque-le « à résilier » dans l'onglet Abonnements.`,
+        });
+      }
+    }
+  }
+
+  // 0bis. Récap permanent : tout abonnement actif consomme de l'argent → rappel quotidien
+  const activeSubs = (data.subs || []).filter((s) => s.status !== "resilie");
+  if (activeSubs.length) {
+    const mTotal = activeSubs.reduce((a, s) => a + (s.period === "an" ? s.amount / 12 : s.amount), 0);
+    const upcoming = activeSubs
+      .filter((s) => s.day && s.period === "mois")
+      .map((s) => ({ s, dans: (s.day - dom + 31) % 31 }))
+      .sort((a, b) => a.dans - b.dans)[0];
+    notifs.push({
+      id: "subs-recap", icon: "💸", tone: C.alert,
+      title: `${activeSubs.length} abonnement${activeSubs.length > 1 ? "s" : ""} actif${activeSubs.length > 1 ? "s" : ""} : ${fmt(mTotal)}/mois`,
+      body: `Soit ${fmt(mTotal * 12)} par an qui partent tout seuls. ${upcoming ? `Prochain prélèvement : ${upcoming.s.name} (${fmt(upcoming.s.amount)}) ${upcoming.dans === 0 ? "aujourd'hui" : upcoming.dans === 1 ? "demain" : `dans ${upcoming.dans} jours`}.` : ""} Chaque abonnement inutile marqué ✂️ = économie directe.`,
+    });
+  }
+
+  // 1. Rappel salaire (autour du 25 et du 05)
+  const monthInc = entries.filter((e) => e.type === "income" && inMonth(e, now));
+  if (((dom >= 24 && dom <= 27) || (dom >= 4 && dom <= 7)) && !monthInc.length) {
+    notifs.push({ id: "salary", icon: "💶", title: "Jour de paie ?", body: "Aucun salaire enregistré ce mois-ci. Dicte « salaire 2 400 euros » dès réception du virement.", tone: C.income });
+  }
+
+  // 2. Alerte catégorie qui dérape (semaine en cours vs précédente)
+  const thisW = entries.filter((e) => e.type === "expense" && inWeek(e, now));
+  const prevW = entries.filter((e) => e.type === "expense" && inWeek(e, new Date(weekStart(now).getTime() - 864e5)));
+  const prevByCat = Object.fromEntries(byCategory(prevW));
+  for (const [cat, v] of byCategory(thisW)) {
+    const prev = prevByCat[cat] || 0;
+    if (prev >= 15 && v > prev * 1.4) {
+      notifs.push({ id: "spike-" + cat, icon: "⚠️", title: `${CAT_ICONS[cat]} ${cat} en hausse`, body: `${fmt(v)} cette semaine contre ${fmt(prev)} la semaine dernière (+${Math.round(((v - prev) / prev) * 100)} %). Un œil sur ce poste ?`, tone: C.alert });
+      break; // une seule alerte de ce type par jour
+    }
+  }
+
+  // 3. Poids des abonnements
+  const abo = sum(entries.filter((e) => e.type === "expense" && e.category === "Abonnements" && inMonth(e, now)));
+  if (abo > 60) {
+    notifs.push({ id: "abo", icon: "📱", title: "Abonnements : " + fmt(abo) + " ce mois", body: "Forfait famille groupé + offres streaming famille : souvent 30–50 €/mois à récupérer sur ce poste.", tone: C.alert });
+  }
+
+  // 4. Journée blanche hier = bravo
+  const yesterday = new Date(now.getTime() - 864e5);
+  const yExp = entries.filter((e) => e.type === "expense" && inDay(e, yesterday));
+  if (entries.length > 3 && !yExp.length) {
+    notifs.push({ id: "zero", icon: "🏆", title: "Journée sans dépense hier", body: "Zéro sortie d'argent hier. Chaque journée blanche compte sur le mois.", tone: C.income });
+  }
+
+  // 5. Conseil du jour (rotation)
+  const doy = Math.floor((now - new Date(now.getFullYear(), 0, 0)) / 864e5);
+  const tip = DAILY_TIPS[doy % DAILY_TIPS.length];
+  notifs.push({ id: "tip", icon: tip.icon, title: "Bon plan du jour · " + tip.title, body: tip.body, tone: C.ink });
+
+  return notifs;
+}
+
+/* ═════════ COMPOSANT PRINCIPAL ═════════ */
+function BudgetVocal() {
+  const [data, setData] = useState(null);
+  const [tab, setTab] = useState("jour");
+  const [listening, setListening] = useState(false);
+  const [pending, setPending] = useState(null);
+  const [heard, setHeard] = useState("");
+  const [dictation, setDictation] = useState(null); // null | {reason}
+  const [dictText, setDictText] = useState("");
+  const [report, setReport] = useState(null);
+  const [reportQueue, setReportQueue] = useState([]);
+  const [notifOpen, setNotifOpen] = useState(false);
+  const [editing, setEditing] = useState(null);
+  const [now, setNow] = useState(new Date());
+  const recRef = useRef(null);
+  const dictRef = useRef(null);
+  const dataRef = useRef(null);
+  dataRef.current = data;
+
+  useEffect(() => { loadData().then(setData); }, []);
+  useEffect(() => { const t = setInterval(() => setNow(new Date()), 30000); return () => clearInterval(t); }, []);
+  useEffect(() => { if (dictation && dictRef.current) setTimeout(() => dictRef.current?.focus(), 150); }, [dictation]);
+
+  /* ── Rapports automatiques dès 20h ── */
+  useEffect(() => {
+    if (!data) return;
+    const d = new Date();
+    if (d.getHours() < 20) return;
+    const queue = [];
+    const seen = data.seen || {};
+    if (seen.daily !== dayKey(d)) queue.push("jour");
+    if (d.getDay() === 0 && seen.weekly !== weekKey(d)) queue.push("semaine");
+    if (isLastDayOfMonth(d) && seen.monthly !== monthKey(d)) queue.push("mois");
+    if (queue.length && !report) {
+      setReport({ kind: queue[0], auto: true });
+      setReportQueue(queue.slice(1));
+      const newSeen = { ...seen };
+      if (queue.includes("jour")) newSeen.daily = dayKey(d);
+      if (queue.includes("semaine")) newSeen.weekly = weekKey(d);
+      if (queue.includes("mois")) newSeen.monthly = monthKey(d);
+      const nd = { ...data, seen: newSeen };
+      setData(nd); saveData(nd);
+    }
+  }, [data, now]); // eslint-disable-line
+
+  const closeReport = () => {
+    if (reportQueue.length) { setReport({ kind: reportQueue[0], auto: true }); setReportQueue(reportQueue.slice(1)); }
+    else setReport(null);
+  };
+
+  /* ── VOCAL : SpeechRecognition, puis repli dictée iPhone ──
+     Dans certains environnements (app Claude, iframe, permission micro
+     refusée), l'API SpeechRecognition est bloquée. Dans ce cas on ouvre
+     automatiquement le champ de dictée : le micro 🎤 du CLAVIER iPhone
+     fonctionne toujours, et le texte dicté est analysé pareil. */
+  const speechSupported = typeof window !== "undefined" && (window.SpeechRecognition || window.webkitSpeechRecognition);
+
+  const openDictation = (reason) => {
+    setListening(false);
+    setDictText("");
+    setDictation({ reason });
+  };
+
+  const startListening = useCallback(() => {
+    if (!speechSupported) { openDictation("unsupported"); return; }
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    let gotResult = false;
+    let rec;
+    try { rec = new SR(); } catch { openDictation("error"); return; }
+    rec.lang = "fr-FR";
+    rec.interimResults = true;
+    rec.continuous = false;
+    recRef.current = rec;
+    setHeard(""); setListening(true);
+
+    // Si rien ne se passe en 4 s (micro bloqué silencieusement) → dictée
+    const watchdog = setTimeout(() => {
+      if (!gotResult) { try { rec.stop(); } catch {} openDictation("timeout"); }
+    }, 4000);
+
+    rec.onaudiostart = () => { gotResult = true; };
+    rec.onresult = (ev) => {
+      gotResult = true;
+      clearTimeout(watchdog);
+      const t = Array.from(ev.results).map((r) => r[0].transcript).join(" ");
+      setHeard(t);
+      if (ev.results[ev.results.length - 1].isFinal) {
+        setListening(false);
+        setPending({ ...parseUtterance(t), raw: t });
+      }
+    };
+    rec.onerror = (ev) => {
+      clearTimeout(watchdog);
+      setListening(false);
+      openDictation(ev?.error || "error");
+    };
+    rec.onend = () => { clearTimeout(watchdog); setListening(false); };
+    try { rec.start(); } catch { clearTimeout(watchdog); openDictation("error"); }
+  }, [speechSupported]);
+
+  const stopListening = () => { try { recRef.current?.stop(); } catch {} setListening(false); };
+
+  const submitDictation = () => {
+    const p = parseUtterance(dictText);
+    if (p.amount) { setPending({ ...p, raw: dictText }); setDictation(null); setDictText(""); }
+  };
+
+  const confirmPending = async () => {
+    if (!pending || !pending.amount) return;
+    const entry = {
+      id: Date.now() + "-" + Math.random().toString(36).slice(2, 6),
+      type: pending.type, label: pending.label, amount: pending.amount,
+      category: pending.category, ts: Date.now(),
+    };
+    const nd = { ...dataRef.current, entries: [...dataRef.current.entries, entry] };
+    setData(nd); setPending(null); setHeard("");
+    await saveData(nd);
+  };
+
+  const deleteEntry = async (id) => {
+    const nd = { ...data, entries: data.entries.filter((e) => e.id !== id) };
+    setData(nd); setEditing(null); await saveData(nd);
+  };
+
+  const saveEdit = async () => {
+    if (!editing || !editing.amount) return;
+    const nd = {
+      ...data,
+      entries: data.entries.map((e) => e.id === editing.id
+        ? { ...e, label: editing.label, amount: editing.amount, category: editing.category, type: editing.category === "Revenu" ? "income" : "expense" }
+        : e),
+    };
+    setData(nd); setEditing(null); await saveData(nd);
+  };
+
+  if (!data) return (
+    <div style={{ minHeight: "100vh", background: C.paper, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: FONT_DISPLAY, color: C.inkSoft }}>
+      Chargement…
+    </div>
+  );
+
+  const today = new Date();
+  const todayExp = data.entries.filter((e) => e.type === "expense" && inDay(e, today));
+  const monthExp = data.entries.filter((e) => e.type === "expense" && inMonth(e, today));
+  const monthInc = data.entries.filter((e) => e.type === "income" && inMonth(e, today));
+  const solde = sum(monthInc) - sum(monthExp);
+  const notifs = genNotifications(data, today);
+  const unread = (data.seen?.notifRead === dayKey(today)) ? 0 : notifs.length;
+
+  const markNotifsRead = () => {
+    setNotifOpen(true);
+    if (data.seen?.notifRead !== dayKey(today)) {
+      const nd = { ...data, seen: { ...data.seen, notifRead: dayKey(today) } };
+      setData(nd); saveData(nd);
+    }
+  };
+
+  const dictPreview = dictText ? parseUtterance(dictText) : null;
+
+  return (
+    <div style={{ minHeight: "100vh", background: C.paper, fontFamily: FONT_DISPLAY, color: C.ink, paddingBottom: 150 }}>
+      <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+      <style>{`
+        @keyframes pulse { 0%{box-shadow:0 0 0 0 ${C.micGlow}} 70%{box-shadow:0 0 0 22px rgba(159,211,184,0)} 100%{box-shadow:0 0 0 0 rgba(159,211,184,0)} }
+        @keyframes slideUp { from{transform:translateY(24px);opacity:0} to{transform:translateY(0);opacity:1} }
+        @media (prefers-reduced-motion: reduce){ *{animation:none!important;transition:none!important} }
+        button { -webkit-tap-highlight-color: transparent; }
+        nav::-webkit-scrollbar { display: none; }
+      `}</style>
+
+      {/* ── En-tête ── */}
+      <header style={{ padding: "max(env(safe-area-inset-top), 20px) 20px 14px", borderBottom: `1px solid ${C.line}` }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+          <div>
+            <div style={{ fontSize: 11, letterSpacing: "0.14em", textTransform: "uppercase", color: C.inkSoft }}>
+              Solde · {today.toLocaleDateString("fr-FR", { month: "long", year: "numeric" })}
+            </div>
+            <div style={{ fontFamily: FONT_MONO, fontSize: 32, fontWeight: 600, color: solde >= 0 ? C.income : C.expense, marginTop: 2 }}>
+              {solde >= 0 ? "+" : ""}{fmt(solde)}
+            </div>
+            <div style={{ fontFamily: FONT_MONO, fontSize: 12, color: C.inkSoft, marginTop: 4 }}>
+              Entrées <span style={{ color: C.income }}>{fmt(sum(monthInc))}</span> · Sorties <span style={{ color: C.expense }}>{fmt(sum(monthExp))}</span>
+            </div>
+          </div>
+          {/* Cloche notifications */}
+          <button onClick={markNotifsRead} aria-label="Notifications" style={{ position: "relative", border: `1px solid ${C.line}`, background: C.card, borderRadius: 999, width: 44, height: 44, fontSize: 19, cursor: "pointer" }}>
+            🔔
+            {unread > 0 && (
+              <span style={{ position: "absolute", top: -4, right: -4, background: C.expense, color: "#fff", fontSize: 11, fontWeight: 700, fontFamily: FONT_MONO, borderRadius: 999, minWidth: 19, height: 19, display: "flex", alignItems: "center", justifyContent: "center", padding: "0 4px" }}>{unread}</span>
+            )}
+          </button>
+        </div>
+      </header>
+
+      {/* ── Onglets ── */}
+      <nav style={{ display: "flex", gap: 6, padding: "16px 20px 0", overflowX: "auto", scrollbarWidth: "none" }}>
+        {[["jour", "Aujourd'hui"], ["abos", "Abonnements"], ["aides", "Aides"], ["bons", "Bons plans"], ["rapports", "Rapports"], ["historique", "Historique"]].map(([k, l]) => (
+          <button key={k} onClick={() => setTab(k)} style={{
+            padding: "8px 14px", borderRadius: 999, border: `1px solid ${tab === k ? C.ink : C.line}`,
+            background: tab === k ? C.ink : "transparent", color: tab === k ? C.paper : C.inkSoft,
+            fontFamily: FONT_DISPLAY, fontSize: 13.5, fontWeight: 500, cursor: "pointer", whiteSpace: "nowrap", flexShrink: 0,
+          }}>{l}</button>
+        ))}
+      </nav>
+
+      {/* ── Contenu ── */}
+      <main style={{ padding: "18px 20px 0" }}>
+        {tab === "jour" && (
+          <>
+            {/* Mini-notification en tête de journée */}
+            {notifs.length > 0 && (
+              <button onClick={markNotifsRead} style={{ display: "flex", gap: 10, alignItems: "flex-start", width: "100%", textAlign: "left", padding: "12px 14px", background: C.card, border: `1px dashed ${notifs[0].tone}`, borderRadius: 12, marginBottom: 16, cursor: "pointer", fontFamily: FONT_DISPLAY }}>
+                <span style={{ fontSize: 20 }}>{notifs[0].icon}</span>
+                <span style={{ fontSize: 13.5, color: C.ink, lineHeight: 1.5 }}>
+                  <strong>{notifs[0].title}</strong> — {notifs[0].body.slice(0, 90)}{notifs[0].body.length > 90 ? "… " : " "}
+                  <span style={{ color: C.inkSoft, textDecoration: "underline" }}>voir tout</span>
+                </span>
+              </button>
+            )}
+            <TodayView entries={todayExp} onDelete={deleteEntry} onEdit={(e) => setEditing({ ...e })} today={today} />
+          </>
+        )}
+        {tab === "abos" && <AbosView subs={data.subs || []} emails={data.emails || []} onChange={async (subs, emails) => { const nd = { ...data, subs, emails }; setData(nd); await saveData(nd); }} />}
+        {tab === "aides" && <AidesView profile={data.profile || {}} onSave={async (p) => { const nd = { ...data, profile: p }; setData(nd); await saveData(nd); }} />}
+        {tab === "bons" && <DealsView />}
+        {tab === "rapports" && <ReportsMenu onOpen={(k) => setReport({ kind: k, auto: false })} />}
+        {tab === "historique" && <HistoryView entries={data.entries} onDelete={deleteEntry} onEdit={(e) => setEditing({ ...e })} />}
+      </main>
+
+      {/* ── Centre de notifications ── */}
+      {notifOpen && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(22,48,43,0.45)", zIndex: 65, display: "flex", alignItems: "flex-end" }} onClick={() => setNotifOpen(false)}>
+          <div onClick={(e) => e.stopPropagation()} style={{ background: C.paper, width: "100%", maxHeight: "80vh", overflowY: "auto", borderRadius: "20px 20px 0 0", padding: "22px 20px calc(env(safe-area-inset-bottom) + 22px)", animation: "slideUp .25s ease" }}>
+            <h2 style={{ fontSize: 18, fontWeight: 700, margin: "0 0 14px" }}>🔔 Conseils du jour</h2>
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {notifs.map((n) => (
+                <div key={n.id} style={{ background: C.card, borderLeft: `3px solid ${n.tone}`, borderRadius: 12, padding: "13px 15px" }}>
+                  <div style={{ fontSize: 14.5, fontWeight: 600 }}>{n.icon} {n.title}</div>
+                  <div style={{ fontSize: 13, color: C.inkSoft, marginTop: 4, lineHeight: 1.55 }}>{n.body}</div>
+                </div>
+              ))}
+            </div>
+            <button onClick={() => setNotifOpen(false)} style={{ width: "100%", marginTop: 16, padding: 14, borderRadius: 14, border: "none", background: C.ink, color: C.paper, fontSize: 15, fontWeight: 600, cursor: "pointer" }}>Fermer</button>
+          </div>
+        </div>
+      )}
+
+      {/* ── Écoute en cours ── */}
+      {listening && (
+        <div style={{ position: "fixed", left: 20, right: 20, bottom: 130, background: C.ink, color: C.paper, borderRadius: 16, padding: "14px 18px", animation: "slideUp .25s ease", zIndex: 40 }}>
+          <div style={{ fontSize: 11, letterSpacing: "0.12em", textTransform: "uppercase", opacity: 0.7 }}>Je t'écoute…</div>
+          <div style={{ fontFamily: FONT_MONO, fontSize: 15, marginTop: 4, minHeight: 22 }}>{heard || "ex. « courses 32 euros »"}</div>
+        </div>
+      )}
+
+      {/* ── DICTÉE (repli fiable à 100 % sur iPhone) ── */}
+      {dictation && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(22,48,43,0.45)", zIndex: 60, display: "flex", alignItems: "flex-end" }} onClick={() => setDictation(null)}>
+          <div onClick={(e) => e.stopPropagation()} style={{ background: C.card, width: "100%", borderRadius: "20px 20px 0 0", padding: "22px 20px calc(env(safe-area-inset-bottom) + 22px)", animation: "slideUp .25s ease" }}>
+            <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 6 }}>🎤 Parle, je t'écoute</div>
+            <div style={{ fontSize: 13, color: C.inkSoft, lineHeight: 1.55, marginBottom: 14 }}>
+              {dictation.reason !== "primary" && "Le micro direct est bloqué dans cet environnement. "}
+              Touche le champ ci-dessous, puis appuie sur le <strong>micro 🎤 du clavier iPhone</strong> (en bas à droite du clavier) et dicte ta dépense.
+            </div>
+            <input ref={dictRef} value={dictText} onChange={(e) => setDictText(e.target.value)} onKeyDown={(e) => e.key === "Enter" && submitDictation()}
+              placeholder="« courses 32 euros 50 »" enterKeyHint="done"
+              style={{ width: "100%", padding: "15px 14px", borderRadius: 12, border: `2px solid ${C.ink}`, fontSize: 17, fontFamily: FONT_MONO, outline: "none", boxSizing: "border-box" }} />
+            {dictPreview && dictPreview.amount && (
+              <div style={{ marginTop: 10, fontSize: 13.5, color: C.inkSoft }}>
+                Compris : <strong style={{ color: C.ink }}>{dictPreview.label}</strong> · {CAT_ICONS[dictPreview.category]} {dictPreview.category} · <span style={{ fontFamily: FONT_MONO, color: dictPreview.type === "income" ? C.income : C.expense }}>{fmt(dictPreview.amount)}</span>
+              </div>
+            )}
+            <button onClick={submitDictation} disabled={!dictPreview?.amount} style={{ width: "100%", marginTop: 14, padding: 15, borderRadius: 14, border: "none", background: dictPreview?.amount ? C.ink : C.line, color: C.paper, fontSize: 15, fontWeight: 600, cursor: "pointer" }}>Valider</button>
+          </div>
+        </div>
+      )}
+
+      {/* ── Confirmation ── */}
+      {pending && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(22,48,43,0.45)", zIndex: 70, display: "flex", alignItems: "flex-end" }} onClick={() => setPending(null)}>
+          <div onClick={(e) => e.stopPropagation()} style={{ background: C.card, width: "100%", borderRadius: "20px 20px 0 0", padding: "22px 20px calc(env(safe-area-inset-bottom) + 22px)", animation: "slideUp .25s ease" }}>
+            <div style={{ fontSize: 11, letterSpacing: "0.14em", textTransform: "uppercase", color: C.inkSoft }}>J'ai compris</div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 10 }}>
+              <input value={pending.label} onChange={(e) => setPending({ ...pending, label: e.target.value })}
+                style={{ fontFamily: FONT_DISPLAY, fontSize: 19, fontWeight: 500, border: "none", borderBottom: `1px dashed ${C.line}`, background: "transparent", color: C.ink, width: "55%", outline: "none" }} />
+              <input type="number" inputMode="decimal" value={pending.amount ?? ""} onChange={(e) => setPending({ ...pending, amount: parseFloat(e.target.value) || null })}
+                style={{ fontFamily: FONT_MONO, fontSize: 24, fontWeight: 600, border: "none", borderBottom: `1px dashed ${C.line}`, background: "transparent", color: pending.type === "income" ? C.income : C.expense, width: "35%", textAlign: "right", outline: "none" }} />
+            </div>
+            <div style={{ display: "flex", gap: 8, marginTop: 16, flexWrap: "wrap" }}>
+              {[...Object.keys(CATEGORIES), "Autre", "Revenu"].map((c) => (
+                <button key={c} onClick={() => setPending({ ...pending, category: c, type: c === "Revenu" ? "income" : "expense" })}
+                  style={{ padding: "6px 11px", borderRadius: 999, fontSize: 12.5, cursor: "pointer", border: `1px solid ${pending.category === c ? C.ink : C.line}`, background: pending.category === c ? C.ink : "transparent", color: pending.category === c ? C.paper : C.inkSoft }}>
+                  {CAT_ICONS[c]} {c}
+                </button>
+              ))}
+            </div>
+            <div style={{ display: "flex", gap: 10, marginTop: 20 }}>
+              <button onClick={() => setPending(null)} style={{ flex: 1, padding: 14, borderRadius: 14, border: `1px solid ${C.line}`, background: "transparent", color: C.inkSoft, fontSize: 15, cursor: "pointer" }}>Annuler</button>
+              <button onClick={confirmPending} disabled={!pending.amount} style={{ flex: 2, padding: 14, borderRadius: 14, border: "none", background: pending.amount ? (pending.type === "income" ? C.income : C.ink) : C.line, color: C.paper, fontSize: 15, fontWeight: 600, cursor: "pointer" }}>
+                {pending.type === "income" ? "Enregistrer le revenu" : "Enregistrer la dépense"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Modification d'une opération ── */}
+      {editing && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(22,48,43,0.45)", zIndex: 70, display: "flex", alignItems: "flex-end" }} onClick={() => setEditing(null)}>
+          <div onClick={(e) => e.stopPropagation()} style={{ background: C.card, width: "100%", borderRadius: "20px 20px 0 0", padding: "22px 20px calc(env(safe-area-inset-bottom) + 22px)", animation: "slideUp .25s ease" }}>
+            <div style={{ fontSize: 11, letterSpacing: "0.14em", textTransform: "uppercase", color: C.inkSoft }}>
+              ✏️ Modifier · {new Date(editing.ts).toLocaleDateString("fr-FR", { day: "numeric", month: "long" })}
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 10 }}>
+              <input value={editing.label} onChange={(e) => setEditing({ ...editing, label: e.target.value })}
+                style={{ fontFamily: FONT_DISPLAY, fontSize: 19, fontWeight: 500, border: "none", borderBottom: `1px dashed ${C.line}`, background: "transparent", color: C.ink, width: "55%", outline: "none" }} />
+              <input type="number" inputMode="decimal" value={editing.amount ?? ""} onChange={(e) => setEditing({ ...editing, amount: parseFloat(e.target.value) || null })}
+                style={{ fontFamily: FONT_MONO, fontSize: 24, fontWeight: 600, border: "none", borderBottom: `1px dashed ${C.line}`, background: "transparent", color: editing.category === "Revenu" ? C.income : C.expense, width: "35%", textAlign: "right", outline: "none" }} />
+            </div>
+            <div style={{ display: "flex", gap: 8, marginTop: 16, flexWrap: "wrap" }}>
+              {[...Object.keys(CATEGORIES), "Autre", "Revenu"].map((c) => (
+                <button key={c} onClick={() => setEditing({ ...editing, category: c })}
+                  style={{ padding: "6px 11px", borderRadius: 999, fontSize: 12.5, cursor: "pointer", border: `1px solid ${editing.category === c ? C.ink : C.line}`, background: editing.category === c ? C.ink : "transparent", color: editing.category === c ? C.paper : C.inkSoft }}>
+                  {CAT_ICONS[c]} {c}
+                </button>
+              ))}
+            </div>
+            <div style={{ display: "flex", gap: 10, marginTop: 20 }}>
+              <button onClick={() => deleteEntry(editing.id)} style={{ flex: 1, padding: 14, borderRadius: 14, border: `1px solid ${C.expense}`, background: "transparent", color: C.expense, fontSize: 15, fontWeight: 600, cursor: "pointer" }}>🗑️ Supprimer</button>
+              <button onClick={saveEdit} disabled={!editing.amount} style={{ flex: 2, padding: 14, borderRadius: 14, border: "none", background: editing.amount ? C.ink : C.line, color: C.paper, fontSize: 15, fontWeight: 600, cursor: "pointer" }}>Enregistrer</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Rapport ── */}
+      {report && <ReportModal kind={report.kind} auto={report.auto} entries={data.entries} onClose={closeReport} remaining={reportQueue.length} />}
+
+      {/* ── Bouton micro ── */}
+      <div style={{ position: "fixed", bottom: 0, left: 0, right: 0, padding: "0 0 calc(env(safe-area-inset-bottom) + 18px)", display: "flex", flexDirection: "column", alignItems: "center", gap: 8, background: `linear-gradient(transparent, ${C.paper} 45%)`, paddingTop: 30, zIndex: 30 }}>
+        <button
+          onClick={listening ? stopListening : () => openDictation("primary")}
+          aria-label={listening ? "Arrêter l'écoute" : "Déclarer une dépense à la voix"}
+          style={{
+            width: 78, height: 78, borderRadius: "50%", border: "none", cursor: "pointer",
+            background: listening ? C.expense : C.ink, color: C.paper, fontSize: 30,
+            animation: listening ? "pulse 1.4s infinite" : "none",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            boxShadow: "0 6px 20px rgba(22,48,43,0.3)",
+          }}>
+          {listening ? "■" : "🎙️"}
+        </button>
+        <button onClick={startListening} style={{ border: "none", background: "transparent", color: C.inkSoft, fontSize: 12.5, cursor: "pointer", textDecoration: "underline" }}>
+          essayer le micro direct (Safari)
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ═════════ VUE AUJOURD'HUI ═════════ */
+function TodayView({ entries, onDelete, onEdit, today }) {
+  const total = sum(entries);
+  return (
+    <section>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 10 }}>
+        <h2 style={{ fontSize: 16, fontWeight: 700, margin: 0, textTransform: "capitalize" }}>{fmtDate(today)}</h2>
+        <span style={{ fontFamily: FONT_MONO, fontSize: 17, fontWeight: 600, color: C.expense }}>{fmt(total)}</span>
+      </div>
+      <Receipt entries={entries} onDelete={onDelete} onEdit={onEdit} empty="Aucune dépense aujourd'hui. Appuie sur le micro et dis par exemple « boulangerie 4 euros 50 »." />
+    </section>
+  );
+}
+
+/* ── Reçu (ticket de caisse) ── */
+function Receipt({ entries, onDelete, onEdit, empty }) {
+  if (!entries.length) return (
+    <div style={{ padding: "26px 18px", background: C.card, borderRadius: 14, border: `1px dashed ${C.line}`, color: C.inkSoft, fontSize: 14, lineHeight: 1.6 }}>{empty}</div>
+  );
+  return (
+    <div style={{ background: C.card, borderRadius: "4px 4px 14px 14px", padding: "4px 0 14px", boxShadow: "0 2px 10px rgba(22,48,43,0.06)", position: "relative" }}>
+      <div style={{ height: 8, background: `repeating-linear-gradient(90deg, ${C.paper} 0 8px, transparent 8px 16px)`, borderRadius: "4px 4px 0 0" }} />
+      {[...entries].sort((a, b) => b.ts - a.ts).map((e) => (
+        <div key={e.id} onClick={() => onEdit && onEdit(e)} role="button"
+          style={{ display: "flex", alignItems: "center", gap: 10, padding: "11px 16px", borderBottom: `1px dashed ${C.line}`, cursor: onEdit ? "pointer" : "default" }}>
+          <span style={{ fontSize: 18 }}>{CAT_ICONS[e.category] || "📦"}</span>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontSize: 14.5, fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{e.label}</div>
+            <div style={{ fontSize: 11.5, color: C.inkSoft }}>{e.category} · {new Date(e.ts).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })}{onEdit ? " · toucher pour modifier" : ""}</div>
+          </div>
+          <span style={{ fontFamily: FONT_MONO, fontSize: 15, fontWeight: 600, color: e.type === "income" ? C.income : C.ink }}>
+            {e.type === "income" ? "+" : "−"}{fmt(e.amount)}
+          </span>
+          <button onClick={(ev) => { ev.stopPropagation(); onDelete(e.id); }} aria-label="Supprimer" style={{ border: "none", background: "transparent", color: C.line, fontSize: 16, cursor: "pointer", padding: 4 }}>✕</button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* ═════════ BONS PLANS ═════════ */
+function DealsView() {
+  return (
+    <section style={{ display: "flex", flexDirection: "column", gap: 18 }}>
+      <p style={{ fontSize: 13, color: C.inkSoft, lineHeight: 1.6, margin: "0 2px" }}>
+        Sélection pour une famille de 5 à Paris. Les catalogues des enseignes changent chaque semaine (nouveau prospectus Lidl dès le mercredi) — le conseil du jour 🔔 te rappelle les bons réflexes.
+      </p>
+      {DEALS.map((sec) => (
+        <div key={sec.section}>
+          <div style={{ fontSize: 12, letterSpacing: "0.1em", textTransform: "uppercase", color: C.inkSoft, marginBottom: 8, fontWeight: 600 }}>{sec.section}</div>
+          <div style={{ background: C.card, borderRadius: 14, boxShadow: "0 2px 10px rgba(22,48,43,0.06)" }}>
+            {sec.items.map((it, i) => (
+              <div key={it.t} style={{ padding: "13px 16px", borderBottom: i < sec.items.length - 1 ? `1px dashed ${C.line}` : "none" }}>
+                <div style={{ fontSize: 14.5, fontWeight: 600 }}>{it.t}</div>
+                <div style={{ fontSize: 13, color: C.inkSoft, marginTop: 3, lineHeight: 1.55 }}>{it.d}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+    </section>
+  );
+}
+
+/* ═════════ ABONNEMENTS (multi-adresses + rappels résiliation) ═════════ */
+const SUB_SUGGESTIONS = [
+  { name: "Apple Services", amount: 10.99, period: "mois", day: 7, email: "imvddj@gmail.com" },
+  { name: "Spotify", amount: 7.07, period: "mois", day: 23, email: "imvddj@gmail.com" },
+];
+
+function AbosView({ subs, emails, onChange }) {
+  const [newEmail, setNewEmail] = useState("");
+  const [form, setForm] = useState({ name: "", amount: "", day: "", period: "mois", email: emails[0] || "" });
+  const [cancelDateFor, setCancelDateFor] = useState(null);
+
+  const monthlyTotal = subs.filter((s) => s.status !== "resilie").reduce((a, s) => a + (s.period === "an" ? s.amount / 12 : s.amount), 0);
+  const cancelSavings = subs.filter((s) => s.status === "resilier").reduce((a, s) => a + (s.period === "an" ? s.amount : s.amount * 12), 0);
+
+  const addEmail = () => {
+    const e = newEmail.trim().toLowerCase();
+    if (e && e.includes("@") && !emails.includes(e)) { onChange(subs, [...emails, e]); setNewEmail(""); }
+  };
+  const removeEmail = (e) => onChange(subs.map((s) => s.email === e ? { ...s, email: "" } : s), emails.filter((x) => x !== e));
+
+  const addSub = (s) => {
+    const amount = parseFloat(String(s.amount).replace(",", "."));
+    if (!s.name || !amount) return;
+    onChange([...subs, { id: Date.now() + "-" + Math.random().toString(36).slice(2, 5), name: s.name, amount, period: s.period || "mois", day: parseInt(s.day) || null, email: s.email || "", status: "actif" }], emails);
+    setForm({ name: "", amount: "", day: "", period: "mois", email: emails[0] || "" });
+  };
+  const updateSub = (id, patch) => onChange(subs.map((s) => s.id === id ? { ...s, ...patch } : s), emails);
+  const removeSub = (id) => onChange(subs.filter((s) => s.id !== id), emails);
+
+  const suggestions = SUB_SUGGESTIONS.filter((sg) => !subs.some((s) => s.name === sg.name));
+
+  return (
+    <section style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      {/* Total */}
+      <div style={{ background: C.ink, color: C.paper, borderRadius: 14, padding: "16px 18px" }}>
+        <div style={{ fontSize: 11, letterSpacing: "0.14em", textTransform: "uppercase", opacity: 0.7 }}>Coût des abonnements suivis</div>
+        <div style={{ fontFamily: FONT_MONO, fontSize: 26, fontWeight: 600, marginTop: 2 }}>
+          {fmt(monthlyTotal)}<span style={{ fontSize: 14, opacity: 0.7 }}> /mois</span>
+          <span style={{ fontSize: 13, opacity: 0.7 }}>  ≈ {fmt(monthlyTotal * 12)}/an</span>
+        </div>
+        {cancelSavings > 0 && (
+          <div style={{ fontSize: 12.5, marginTop: 6, color: C.micGlow }}>✂️ {fmt(cancelSavings)}/an d'économie en attente de résiliation</div>
+        )}
+      </div>
+
+      {/* Adresses mail */}
+      <div style={{ background: C.card, borderRadius: 14, padding: "14px 16px" }}>
+        <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 4 }}>📧 Tes adresses mail</div>
+        <div style={{ fontSize: 12, color: C.inkSoft, lineHeight: 1.55, marginBottom: 10 }}>
+          Pour un scan automatique d'une boîte, connecte-la à Claude (Paramètres → Connecteurs) puis demande-moi « relance le scan ». Ici, les adresses servent à rattacher chaque abonnement à la bonne boîte.
+        </div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10 }}>
+          {emails.map((e) => (
+            <span key={e} style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "5px 10px", borderRadius: 999, border: `1px solid ${C.line}`, fontSize: 12.5, fontFamily: FONT_MONO }}>
+              {e}
+              <button onClick={() => removeEmail(e)} aria-label={"Retirer " + e} style={{ border: "none", background: "transparent", color: C.expense, cursor: "pointer", fontSize: 13, padding: 0 }}>✕</button>
+            </span>
+          ))}
+          {!emails.length && <span style={{ fontSize: 12.5, color: C.inkSoft }}>Aucune adresse pour l'instant</span>}
+        </div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <input value={newEmail} onChange={(e) => setNewEmail(e.target.value)} onKeyDown={(e) => e.key === "Enter" && addEmail()}
+            placeholder="azedinedj@gmail.com" inputMode="email" autoCapitalize="none"
+            style={{ flex: 1, padding: "10px 12px", borderRadius: 10, border: `1px solid ${C.line}`, fontSize: 14, fontFamily: FONT_MONO, outline: "none", minWidth: 0 }} />
+          <button onClick={addEmail} style={{ padding: "10px 16px", borderRadius: 10, border: "none", background: C.ink, color: C.paper, fontSize: 14, fontWeight: 600, cursor: "pointer" }}>+</button>
+        </div>
+      </div>
+
+      {/* Suggestions issues du scan Gmail */}
+      {suggestions.length > 0 && (
+        <div style={{ background: "#E7F2EB", border: `1px dashed ${C.income}`, borderRadius: 14, padding: "13px 15px" }}>
+          <div style={{ fontSize: 13.5, fontWeight: 600, marginBottom: 8 }}>🔎 Détectés dans la boîte connectée</div>
+          {suggestions.map((sg) => (
+            <div key={sg.name} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0" }}>
+              <span style={{ fontSize: 13.5 }}>{sg.name} · <span style={{ fontFamily: FONT_MONO }}>{fmt(sg.amount)}/mois</span> · le {sg.day}</span>
+              <button onClick={() => addSub(sg)} style={{ padding: "6px 12px", borderRadius: 999, border: "none", background: C.income, color: "#fff", fontSize: 12.5, fontWeight: 600, cursor: "pointer" }}>Suivre</button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Liste des abonnements */}
+      {subs.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {subs.map((s) => (
+            <div key={s.id} style={{ background: C.card, borderLeft: `3px solid ${s.status === "resilier" ? C.expense : C.income}`, borderRadius: 12, padding: "13px 15px" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8 }}>
+                <div style={{ fontSize: 15, fontWeight: 600 }}>{s.name}</div>
+                <div style={{ fontFamily: FONT_MONO, fontSize: 15, fontWeight: 600 }}>{fmt(s.amount)}<span style={{ fontSize: 11, color: C.inkSoft }}>/{s.period}</span></div>
+              </div>
+              <div style={{ fontSize: 12, color: C.inkSoft, marginTop: 3 }}>
+                {s.day ? `Prélevé le ${s.day} · ` : ""}{s.email || "adresse non précisée"}
+                {s.status === "resilier" && <span style={{ color: C.expense, fontWeight: 600 }}> · ✂️ à résilier{s.cancelBy ? ` avant le ${new Date(s.cancelBy + "T12:00").toLocaleDateString("fr-FR", { day: "numeric", month: "short" })}` : ""}</span>}
+              </div>
+              {cancelDateFor === s.id ? (
+                <div style={{ display: "flex", gap: 8, marginTop: 10, alignItems: "center" }}>
+                  <input type="date" onChange={(e) => { updateSub(s.id, { status: "resilier", cancelBy: e.target.value }); setCancelDateFor(null); }}
+                    style={{ flex: 1, padding: "8px 10px", borderRadius: 10, border: `1px solid ${C.line}`, fontSize: 14, fontFamily: FONT_MONO }} />
+                  <button onClick={() => { updateSub(s.id, { status: "resilier", cancelBy: null }); setCancelDateFor(null); }} style={{ padding: "8px 10px", borderRadius: 10, border: `1px solid ${C.line}`, background: "transparent", fontSize: 12.5, cursor: "pointer", color: C.inkSoft }}>Sans date</button>
+                </div>
+              ) : (
+                <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                  {s.status === "resilier" ? (
+                    <>
+                      <button onClick={() => removeSub(s.id)} style={{ flex: 1, padding: "8px 10px", borderRadius: 10, border: "none", background: C.income, color: "#fff", fontSize: 12.5, fontWeight: 600, cursor: "pointer" }}>✓ Résilié !</button>
+                      <button onClick={() => updateSub(s.id, { status: "actif", cancelBy: null })} style={{ flex: 1, padding: "8px 10px", borderRadius: 10, border: `1px solid ${C.line}`, background: "transparent", fontSize: 12.5, cursor: "pointer", color: C.inkSoft }}>Finalement je garde</button>
+                    </>
+                  ) : (
+                    <button onClick={() => setCancelDateFor(s.id)} style={{ flex: 1, padding: "8px 10px", borderRadius: 10, border: `1px solid ${C.expense}`, background: "transparent", color: C.expense, fontSize: 12.5, fontWeight: 600, cursor: "pointer" }}>✂️ À résilier</button>
+                  )}
+                  <button onClick={() => removeSub(s.id)} aria-label="Supprimer" style={{ padding: "8px 12px", borderRadius: 10, border: `1px solid ${C.line}`, background: "transparent", color: C.inkSoft, fontSize: 12.5, cursor: "pointer" }}>✕</button>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Ajout manuel */}
+      <div style={{ background: C.card, borderRadius: 14, padding: "14px 16px" }}>
+        <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 10 }}>➕ Ajouter un abonnement</div>
+        <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+          <input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Netflix, forfait mobile…"
+            style={{ flex: 2, padding: "10px 12px", borderRadius: 10, border: `1px solid ${C.line}`, fontSize: 14, outline: "none", minWidth: 0 }} />
+          <input value={form.amount} onChange={(e) => setForm({ ...form, amount: e.target.value })} placeholder="€" type="number" inputMode="decimal"
+            style={{ flex: 1, padding: "10px 12px", borderRadius: 10, border: `1px solid ${C.line}`, fontSize: 14, fontFamily: FONT_MONO, outline: "none", minWidth: 0 }} />
+        </div>
+        <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+          <input value={form.day} onChange={(e) => setForm({ ...form, day: e.target.value })} placeholder="Jour (1-31)" type="number" inputMode="numeric"
+            style={{ flex: 1, padding: "10px 12px", borderRadius: 10, border: `1px solid ${C.line}`, fontSize: 14, fontFamily: FONT_MONO, outline: "none", minWidth: 0 }} />
+          <select value={form.period} onChange={(e) => setForm({ ...form, period: e.target.value })}
+            style={{ flex: 1, padding: "10px 12px", borderRadius: 10, border: `1px solid ${C.line}`, fontSize: 14, background: "transparent" }}>
+            <option value="mois">/ mois</option>
+            <option value="an">/ an</option>
+          </select>
+          <select value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })}
+            style={{ flex: 2, padding: "10px 12px", borderRadius: 10, border: `1px solid ${C.line}`, fontSize: 13, background: "transparent", minWidth: 0 }}>
+            <option value="">— adresse —</option>
+            {emails.map((e) => <option key={e} value={e}>{e}</option>)}
+          </select>
+        </div>
+        <button onClick={() => addSub(form)} disabled={!form.name || !parseFloat(String(form.amount).replace(",", "."))}
+          style={{ width: "100%", padding: 12, borderRadius: 12, border: "none", background: form.name && parseFloat(String(form.amount).replace(",", ".")) ? C.ink : C.line, color: C.paper, fontSize: 14, fontWeight: 600, cursor: "pointer" }}>
+          Ajouter
+        </button>
+      </div>
+
+      <p style={{ fontSize: 11.5, color: C.inkSoft, lineHeight: 1.6, margin: "0 2px" }}>
+        ✂️ Un abonnement marqué « à résilier » déclenche un rappel quotidien dans les notifications 🔔 jusqu'à la résiliation, avec compte à rebours si tu fixes une date. 📅 La veille et le jour de chaque prélèvement, l'app te demande si l'abonnement vaut toujours le coup. Rappel loi Chatel : les abonnements à tacite reconduction (assurances, salles de sport…) doivent te notifier avant l'échéance — c'est le meilleur moment pour résilier.
+      </p>
+    </section>
+  );
+}
+
+/* ═════════ AIDES (selon revenu fiscal de référence) ═════════ */
+function AidesView({ profile, onSave }) {
+  const [rfr, setRfr] = useState(profile.rfr ?? "");
+  const [kids, setKids] = useState(profile.kids ?? 3);
+  const [saved, setSaved] = useState(!!profile.rfr);
+
+  const submit = () => {
+    const v = parseFloat(String(rfr).replace(",", "."));
+    if (!v) return;
+    onSave({ rfr: v, kids });
+    setSaved(true);
+  };
+
+  const R = parseFloat(String(rfr).replace(",", ".")) || 0;
+  const UC = 1.5 + 0.3 * kids;                      // unités de consommation (couple + enfants)
+  const rfrUC = R ? R / UC : 0;
+  const arsPlafond = 22274 + 6682 * kids;           // ARS 2026 (base 22 274 € + 6 682 €/enfant)
+
+  const badge = (ok, mid) => ok
+    ? { t: "✅ Probable", c: C.income }
+    : mid ? { t: "🟡 Limite — à vérifier", c: C.alert }
+    : { t: "❌ Peu probable", c: C.expense };
+
+  const aides = R ? [
+    {
+      ...badge(R <= arsPlafond, R <= arsPlafond + 1400),
+      name: "Allocation de rentrée scolaire (13 ans)",
+      d: `≈ 450 € versés vers le 20 août (11-14 ans). Plafond ${kids} enfants : ${arsPlafond.toLocaleString("fr-FR")} €. Léger dépassement = ARS différentielle possible. Automatique via la CAF.`,
+    },
+    {
+      ...badge(rfrUC <= 11000, rfrUC <= 12000),
+      name: "Chèque énergie",
+      d: `Ton RFR/UC ≈ ${Math.round(rfrUC).toLocaleString("fr-FR")} € (plafond 11 000 €). Montant 48 à 277 €/an, envoyé automatiquement en avril. Foyer de ${2 + kids} = ${UC.toFixed(1)} UC.`,
+    },
+    ...(kids >= 2 ? [{
+      t: "✅ Automatique", c: C.income,
+      name: `Allocations familiales (${kids} enfants)`,
+      d: `≈ ${kids === 2 ? "151" : kids === 3 ? "350" : Math.round(350 + (kids - 3) * 194)} €/mois à taux plein (revenus < ~81 000 €, montant réduit au-delà) + majoration dès les 14 ans. Versées pour les enfants de moins de 20 ans. Indicatif — vérifie ton taux sur caf.fr.`,
+    }] : []),
+    ...(kids >= 3 ? [{
+      ...badge(R <= 48000, R <= 55000),
+      name: "Complément familial",
+      d: "Pour 3 enfants et + de 3 à 21 ans : ≈ 198 €/mois (majoré si revenus très modestes). Plafond ~48 000 € pour un couple avec deux revenus (indicatif). Attention : les enfants de +21 ans ne comptent plus.",
+    }] : []),
+    {
+      ...badge(R <= 29000, R <= 33000),
+      name: "Bourse de collège (13 ans)",
+      d: "De ~84 à ~510 €/an selon l'échelon (indicatif). Demande sur le portail Scolarité Services en septembre — non automatique !",
+    },
+    {
+      ...badge(R <= 45000, R <= 60000),
+      name: "Bourse CROUS (étudiants 20 & 22 ans)",
+      d: "Dépend du RFR + points de charge (2 enfants étudiants = points en plus, donc plafonds relevés). Si boursiers : Resto U à 1 €, exonération CVEC et frais d'inscription. Simulateur : simulateur.lescrous.fr — dossier DSE janvier-mai.",
+    },
+    {
+      ...badge(R <= 27000, R <= 36500),
+      name: "Complémentaire santé solidaire (CSS)",
+      d: "Mutuelle gratuite (ou < 1 €/jour/personne jusqu'à ~36 500 € pour 5, indicatif). Grosse économie si vous payez une mutuelle familiale. Demande sur ameli.fr.",
+    },
+    {
+      t: "🟡 Selon quotient CAF", c: C.alert,
+      name: "Paris Forfait Familles + cantine",
+      d: "Aide de la Ville de Paris pour les familles de 3 enfants et +, selon quotient familial (≈ 300 €/an, à vérifier sur paris.fr). Et les tarifs cantine/conservatoire/centres de loisirs parisiens dépendent aussi du QF : fais-le calculer, jamais automatique.",
+    },
+    {
+      t: "🔎 Simulateur", c: C.ink,
+      name: "Prime d'activité & tout le reste",
+      d: "Basée sur les salaires du trimestre, pas sur le RFR. Le simulateur officiel mesdroits.social.gouv.fr teste 58 aides d'un coup en 10 minutes — le meilleur investissement de la semaine.",
+    },
+  ] : [];
+
+  return (
+    <section>
+      <div style={{ background: C.card, borderRadius: 14, padding: "16px 16px", marginBottom: 16 }}>
+        <div style={{ fontSize: 14.5, fontWeight: 600, marginBottom: 4 }}>💶 Ton revenu fiscal de référence</div>
+        <div style={{ fontSize: 12.5, color: C.inkSoft, lineHeight: 1.55, marginBottom: 12 }}>
+          Il figure sur ton avis d'imposition, en première page. J'évalue les aides pour votre foyer (couple + enfants à charge).
+        </div>
+        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          <input type="number" inputMode="numeric" value={rfr} onChange={(e) => { setRfr(e.target.value); setSaved(false); }}
+            placeholder="ex. 38 500" style={{ flex: 1, padding: "13px 14px", borderRadius: 12, border: `2px solid ${C.ink}`, fontSize: 17, fontFamily: FONT_MONO, outline: "none", minWidth: 0 }} />
+          <span style={{ fontFamily: FONT_MONO, fontSize: 15 }}>€</span>
+        </div>
+        <div style={{ display: "flex", gap: 12, alignItems: "center", marginTop: 12 }}>
+          <span style={{ fontSize: 13, color: C.inkSoft, flex: 1 }}>Enfants à charge fiscalement :</span>
+          <button onClick={() => { if (kids > 0) { setKids(kids - 1); setSaved(false); } }} aria-label="Retirer un enfant"
+            style={{ width: 38, height: 38, borderRadius: 999, border: `1px solid ${kids > 0 ? C.ink : C.line}`, background: "transparent", color: kids > 0 ? C.ink : C.line, fontSize: 20, fontWeight: 600, cursor: kids > 0 ? "pointer" : "default" }}>−</button>
+          <span style={{ fontFamily: FONT_MONO, fontSize: 20, fontWeight: 600, minWidth: 26, textAlign: "center" }}>{kids}</span>
+          <button onClick={() => { if (kids < 8) { setKids(kids + 1); setSaved(false); } }} aria-label="Ajouter un enfant"
+            style={{ width: 38, height: 38, borderRadius: 999, border: `1px solid ${kids < 8 ? C.ink : C.line}`, background: C.ink, color: C.paper, fontSize: 20, fontWeight: 600, cursor: kids < 8 ? "pointer" : "default" }}>+</button>
+        </div>
+        <div style={{ fontSize: 11.5, color: C.inkSoft, marginTop: 8 }}>
+          💡 Les enfants de 20 et 22 ans comptent seulement s'ils sont rattachés à votre foyer fiscal.
+        </div>
+        <button onClick={submit} disabled={!parseFloat(String(rfr).replace(",", "."))} style={{ width: "100%", marginTop: 12, padding: 13, borderRadius: 12, border: "none", background: parseFloat(String(rfr).replace(",", ".")) ? C.ink : C.line, color: C.paper, fontSize: 14.5, fontWeight: 600, cursor: "pointer" }}>
+          {saved ? "✓ Enregistré — mettre à jour" : "Évaluer mes aides"}
+        </button>
+      </div>
+
+      {R > 0 && (
+        <>
+          <div style={{ fontSize: 12, letterSpacing: "0.1em", textTransform: "uppercase", color: C.inkSoft, marginBottom: 8, fontWeight: 600 }}>
+            Aides possibles · RFR {R.toLocaleString("fr-FR")} € · {2 + kids} personnes
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {aides.map((a) => (
+              <div key={a.name} style={{ background: C.card, borderLeft: `3px solid ${a.c}`, borderRadius: 12, padding: "13px 15px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "baseline" }}>
+                  <div style={{ fontSize: 14.5, fontWeight: 600 }}>{a.name}</div>
+                  <div style={{ fontSize: 11.5, fontWeight: 600, color: a.c, whiteSpace: "nowrap" }}>{a.t}</div>
+                </div>
+                <div style={{ fontSize: 13, color: C.inkSoft, marginTop: 4, lineHeight: 1.55 }}>{a.d}</div>
+              </div>
+            ))}
+          </div>
+          <p style={{ fontSize: 11.5, color: C.inkSoft, lineHeight: 1.6, margin: "14px 2px 0" }}>
+            ⚠️ Estimation indicative (plafonds 2026). L'ARS se calcule sur les revenus nets catégoriels (proches mais pas identiques au RFR), et chaque aide a ses règles précises : la référence reste les simulateurs officiels (mesdroits.social.gouv.fr, caf.fr).
+          </p>
+        </>
+      )}
+    </section>
+  );
+}
+
+/* ═════════ MENU RAPPORTS ═════════ */
+function ReportsMenu({ onOpen }) {
+  const items = [
+    ["jour", "Rapport quotidien", "Généré automatiquement chaque jour à 20h"],
+    ["semaine", "Rapport hebdomadaire", "Chaque dimanche soir, après le quotidien"],
+    ["mois", "Rapport mensuel", "Le dernier jour du mois, après les deux autres"],
+  ];
+  return (
+    <section style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      {items.map(([k, t, s]) => (
+        <button key={k} onClick={() => onOpen(k)} style={{ textAlign: "left", padding: "16px 18px", background: C.card, border: `1px solid ${C.line}`, borderRadius: 14, cursor: "pointer", fontFamily: FONT_DISPLAY }}>
+          <div style={{ fontSize: 15.5, fontWeight: 600, color: C.ink }}>{t}</div>
+          <div style={{ fontSize: 12.5, color: C.inkSoft, marginTop: 3 }}>{s}</div>
+        </button>
+      ))}
+      <p style={{ fontSize: 12.5, color: C.inkSoft, lineHeight: 1.6, margin: "6px 2px 0" }}>
+        Les rapports s'affichent automatiquement dès que tu ouvres l'app après 20h. Ton rappel iPhone quotidien à 20h est déjà en place. ✅
+      </p>
+    </section>
+  );
+}
+
+/* ═════════ HISTORIQUE ═════════ */
+function HistoryView({ entries, onDelete, onEdit }) {
+  const groups = {};
+  for (const e of [...entries].sort((a, b) => b.ts - a.ts)) {
+    const k = dayKey(new Date(e.ts));
+    (groups[k] = groups[k] || []).push(e);
+  }
+  const keys = Object.keys(groups);
+  if (!keys.length) return <div style={{ color: C.inkSoft, fontSize: 14 }}>Aucune opération pour l'instant.</div>;
+  return (
+    <section style={{ display: "flex", flexDirection: "column", gap: 18 }}>
+      {keys.slice(0, 30).map((k) => (
+        <div key={k}>
+          <div style={{ fontSize: 12, letterSpacing: "0.1em", textTransform: "uppercase", color: C.inkSoft, marginBottom: 8 }}>
+            {new Date(k + "T12:00").toLocaleDateString("fr-FR", { weekday: "long", day: "numeric", month: "long" })}
+          </div>
+          <Receipt entries={groups[k]} onDelete={onDelete} onEdit={onEdit} empty="" />
+        </div>
+      ))}
+    </section>
+  );
+}
+
+/* ═════════ MODALE RAPPORT ═════════ */
+function ReportModal({ kind, auto, entries, onClose, remaining }) {
+  const today = new Date();
+  let title, sub, exp, inc, prevExp;
+
+  if (kind === "jour") {
+    title = "Rapport quotidien"; sub = fmtDate(today);
+    exp = entries.filter((e) => e.type === "expense" && inDay(e, today));
+    const last7 = entries.filter((e) => e.type === "expense" && e.ts >= today.getTime() - 7 * 864e5 && !inDay(e, today));
+    prevExp = sum(last7) / 7;
+    inc = [];
+  } else if (kind === "semaine") {
+    title = "Rapport hebdomadaire";
+    const ws = weekStart(today);
+    sub = `Semaine du ${ws.toLocaleDateString("fr-FR", { day: "numeric", month: "long" })}`;
+    exp = entries.filter((e) => e.type === "expense" && inWeek(e, today));
+    const prevRef = new Date(ws.getTime() - 864e5);
+    prevExp = sum(entries.filter((e) => e.type === "expense" && inWeek(e, prevRef)));
+    inc = entries.filter((e) => e.type === "income" && inWeek(e, today));
+  } else {
+    title = "Rapport mensuel";
+    sub = today.toLocaleDateString("fr-FR", { month: "long", year: "numeric" });
+    exp = entries.filter((e) => e.type === "expense" && inMonth(e, today));
+    const prevRef = new Date(today.getFullYear(), today.getMonth() - 1, 15);
+    prevExp = sum(entries.filter((e) => e.type === "expense" && inMonth(e, prevRef)));
+    inc = entries.filter((e) => e.type === "income" && inMonth(e, today));
+  }
+
+  const total = sum(exp);
+  const totalInc = sum(inc);
+  const cats = byCategory(exp);
+  const max = cats.length ? cats[0][1] : 1;
+  const delta = total - prevExp;
+  const deltaLabel = kind === "jour" ? "vs moyenne 7 jours" : kind === "semaine" ? "vs semaine dernière" : "vs mois dernier";
+  const biggest = [...exp].sort((a, b) => b.amount - a.amount)[0];
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(22,48,43,0.5)", zIndex: 80, display: "flex", alignItems: "flex-end" }} onClick={onClose}>
+      <div onClick={(e) => e.stopPropagation()} style={{ background: C.paper, width: "100%", maxHeight: "88vh", overflowY: "auto", borderRadius: "22px 22px 0 0", padding: "24px 20px calc(env(safe-area-inset-bottom) + 24px)", animation: "slideUp .3s ease", fontFamily: FONT_DISPLAY }}>
+        <div style={{ fontSize: 11, letterSpacing: "0.16em", textTransform: "uppercase", color: C.inkSoft }}>
+          {auto ? "⏰ 20h · " : ""}{title}
+        </div>
+        <h2 style={{ fontSize: 22, fontWeight: 700, margin: "4px 0 18px", textTransform: "capitalize", color: C.ink }}>{sub}</h2>
+
+        <div style={{ display: "flex", gap: 10, marginBottom: 18 }}>
+          <Stat label="Dépensé" value={fmt(total)} color={C.expense} />
+          {(kind !== "jour") && <Stat label="Reçu" value={fmt(totalInc)} color={C.income} />}
+          {(kind !== "jour") && <Stat label="Solde" value={fmt(totalInc - total)} color={totalInc - total >= 0 ? C.income : C.expense} />}
+          {kind === "jour" && <Stat label="Opérations" value={String(exp.length)} color={C.ink} />}
+        </div>
+
+        {prevExp > 0 && (
+          <div style={{ fontSize: 13.5, color: delta <= 0 ? C.income : C.expense, marginBottom: 18 }}>
+            {delta <= 0 ? "▼" : "▲"} {fmt(Math.abs(delta))} {deltaLabel}
+          </div>
+        )}
+
+        {cats.length > 0 ? (
+          <div style={{ background: C.card, borderRadius: 14, padding: "16px 16px 8px", marginBottom: 14 }}>
+            <div style={{ fontSize: 11, letterSpacing: "0.12em", textTransform: "uppercase", color: C.inkSoft, marginBottom: 12 }}>Par catégorie</div>
+            {cats.map(([cat, v]) => (
+              <div key={cat} style={{ marginBottom: 12 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13.5, marginBottom: 4 }}>
+                  <span>{CAT_ICONS[cat]} {cat}</span>
+                  <span style={{ fontFamily: FONT_MONO, fontWeight: 600 }}>{fmt(v)}</span>
+                </div>
+                <div style={{ height: 6, background: C.paper, borderRadius: 3 }}>
+                  <div style={{ height: 6, width: `${(v / max) * 100}%`, background: C.expense, borderRadius: 3 }} />
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div style={{ background: C.card, borderRadius: 14, padding: 18, color: C.inkSoft, fontSize: 14, marginBottom: 14 }}>
+            Aucune dépense sur cette période. 👏
+          </div>
+        )}
+
+        {biggest && (
+          <div style={{ fontSize: 13.5, color: C.inkSoft, marginBottom: 20 }}>
+            Plus grosse dépense : <strong style={{ color: C.ink }}>{biggest.label}</strong> — <span style={{ fontFamily: FONT_MONO }}>{fmt(biggest.amount)}</span>
+          </div>
+        )}
+
+        <button onClick={onClose} style={{ width: "100%", padding: 15, borderRadius: 14, border: "none", background: C.ink, color: C.paper, fontSize: 15, fontWeight: 600, cursor: "pointer" }}>
+          {remaining > 0 ? `Rapport suivant (${remaining}) →` : "Fermer"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function Stat({ label, value, color }) {
+  return (
+    <div style={{ flex: 1, background: C.card, borderRadius: 12, padding: "12px 12px" }}>
+      <div style={{ fontSize: 10.5, letterSpacing: "0.1em", textTransform: "uppercase", color: C.inkSoft }}>{label}</div>
+      <div style={{ fontFamily: FONT_MONO, fontSize: 17, fontWeight: 600, color, marginTop: 3, whiteSpace: "nowrap" }}>{value}</div>
+    </div>
+  );
+}
+ReactDOM.createRoot(document.getElementById("root")).render(<BudgetVocal />);
+</script>
+</body>
+</html>
