@@ -9,8 +9,8 @@
     adresse mail dans la colonne « Mail Principal Syncro ».
 
     L'AD est uniquement lu, jamais modifié. Le fichier source n'est pas modifié non plus :
-    le résultat est enregistré dans un nouveau fichier (<nom>_AD.xlsx par défaut), avec un
-    rapport CSV (<nom>_AD_rapport.csv) qui détaille le résultat de chaque ligne.
+    le résultat est enregistré dans un nouveau fichier <nom>_AD_<date>.xlsx du dossier
+    -OutputFolder, avec un rapport CSV <nom>_AD_<date>_rapport.csv qui détaille chaque ligne.
 
     Comparaison des noms (sans tenir compte de la casse, des accents, des tirets ni des apostrophes) :
       1. Exacte         : « NOM PRENOM » ou « PRENOM NOM » (Surname / GivenName), DisplayName ou CN.
@@ -33,10 +33,11 @@
       NON TROUVE      aucun compte AD correspondant
 
 .PARAMETER Path
-    Fichier Excel à traiter.
+    Fichier Excel à traiter. S'il n'est pas indiqué, le chemin est demandé au lancement.
 
-.PARAMETER OutputPath
-    Fichier Excel produit. Par défaut : <nom>_AD.xlsx, dans le dossier du fichier source.
+.PARAMETER OutputFolder
+    Dossier où enregistrer le fichier Excel produit et le rapport. S'il n'existe pas,
+    le dossier du fichier source est utilisé.
 
 .PARAMETER WorksheetName
     Feuille à traiter. Par défaut : la première.
@@ -63,6 +64,10 @@
     Écrit aussi les adresses trouvées par correspondance approximative (nom tronqué).
 
 .EXAMPLE
+    Double-cliquer sur Update-MailPrincipalSyncroFromAD.cmd (placé à côté de ce script) :
+    le script est lancé sans contrôle de signature et demande le fichier Excel à traiter.
+
+.EXAMPLE
     .\Update-MailPrincipalSyncroFromAD.ps1 -Path .\EmailPro-manquants.xlsx
 
 .EXAMPLE
@@ -73,13 +78,16 @@
       - module ActiveDirectory (RSAT) ;
       - module ImportExcel (Install-Module ImportExcel -Scope CurrentUser) ou, à défaut, Microsoft Excel.
     Conserver ce fichier en UTF-8 avec BOM pour que les accents s'affichent correctement.
+
+    Erreur « n'est pas signé numériquement » : lancer le script par Update-MailPrincipalSyncroFromAD.cmd,
+    ou par : powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Update-MailPrincipalSyncroFromAD.ps1
 #>
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
-    [Parameter(Mandatory = $true, Position = 0)]
+    [Parameter(Position = 0)]
     [string]$Path,
 
-    [string]$OutputPath,
+    [string]$OutputFolder = 'C:\Users\Azedine.Djebbouri\OneDrive - PONTICELLI FRERES\Documents',
 
     [string]$WorksheetName,
 
@@ -243,12 +251,33 @@ function Close-Workbook {
 
 #region Chemins
 
-$inputFile = (Resolve-Path -LiteralPath $Path).ProviderPath
-if (-not $OutputPath) {
-    $OutputPath = Join-Path (Split-Path -Parent $inputFile) ([IO.Path]::GetFileNameWithoutExtension($inputFile) + '_AD.xlsx')
+if (-not $Path) {
+    do {
+        # Un fichier glissé dans la fenêtre ou copié avec « Copier en tant que chemin d'accès » arrive entre guillemets
+        $Path = ([string](Read-Host "Chemin du fichier Excel (glissez le fichier dans cette fenêtre, Entrée vide pour quitter)")).Trim().Trim('"')
+        if (-not $Path) {
+            Write-Host 'Abandon.'
+            return
+        }
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+            Write-Warning "Fichier introuvable : $Path"
+            $Path = $null
+        }
+    } while (-not $Path)
 }
-$outputFile = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputPath)
-$reportFile = Join-Path (Split-Path -Parent $outputFile) ([IO.Path]::GetFileNameWithoutExtension($outputFile) + '_rapport.csv')
+$inputFile = (Resolve-Path -LiteralPath $Path).ProviderPath
+
+if (-not (Test-Path -LiteralPath $OutputFolder -PathType Container)) {
+    $fallbackFolder = Split-Path -Parent $inputFile
+    Write-Warning "Dossier de sortie introuvable : $OutputFolder. Enregistrement dans $fallbackFolder."
+    $OutputFolder = $fallbackFolder
+}
+$OutputFolder = (Resolve-Path -LiteralPath $OutputFolder).ProviderPath
+
+# Horodatage : ne remplace pas un résultat précédent, éventuellement encore ouvert dans Excel
+$baseName = [IO.Path]::GetFileNameWithoutExtension($inputFile) + '_AD_' + (Get-Date -Format 'yyyyMMdd-HHmm')
+$outputFile = Join-Path $OutputFolder ($baseName + '.xlsx')
+$reportFile = Join-Path $OutputFolder ($baseName + '_rapport.csv')
 
 #endregion
 
