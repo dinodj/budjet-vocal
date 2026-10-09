@@ -4,9 +4,10 @@
     des utilisateurs trouvés dans l'Active Directory.
 
 .DESCRIPTION
-    Pour chaque ligne du fichier Excel, le script lit le nom de la colonne « Nom et prénom »
-    (format « NOM PRENOM »), cherche l'utilisateur correspondant dans l'AD et écrit son
-    adresse mail dans la colonne « Mail Principal Syncro ».
+    Pour chaque ligne du fichier Excel, le script lit le nom de la personne, soit dans deux
+    colonnes « Nom » et « Prénom », soit dans une seule colonne « Nom et prénom » (format
+    « NOM PRENOM »), cherche l'utilisateur correspondant dans l'AD et écrit son adresse mail
+    dans la colonne « Mail Principal Syncro ».
 
     L'AD est uniquement lu, jamais modifié. Le fichier source n'est pas modifié non plus :
     le résultat est enregistré dans un nouveau fichier <nom>_AD_<date>.xlsx du dossier
@@ -42,8 +43,15 @@
 .PARAMETER WorksheetName
     Feuille à traiter. Par défaut : la première.
 
+.PARAMETER LastNameColumnHeader
+    En-tête de la colonne du nom de famille, utilisée avec -FirstNameColumnHeader.
+    Les en-têtes sont comparés sans tenir compte de la casse ni des accents.
+
+.PARAMETER FirstNameColumnHeader
+    En-tête de la colonne du prénom, utilisée avec -LastNameColumnHeader.
+
 .PARAMETER NameColumnHeader
-    En-tête de la colonne des noms (comparé sans tenir compte de la casse ni des accents).
+    En-tête de la colonne « NOM PRENOM », utilisée si les colonnes Nom et Prénom n'existent pas.
 
 .PARAMETER MailColumnHeader
     En-tête de la colonne à compléter. Elle est créée si elle n'existe pas.
@@ -90,6 +98,10 @@ param(
     [string]$OutputFolder = 'C:\Users\Azedine.Djebbouri\OneDrive - PONTICELLI FRERES\Documents',
 
     [string]$WorksheetName,
+
+    [string]$LastNameColumnHeader = 'Nom',
+
+    [string]$FirstNameColumnHeader = 'Prenom',
 
     [string]$NameColumnHeader = 'Nom et prenom',
 
@@ -291,21 +303,30 @@ $results = New-Object System.Collections.Generic.List[object]
 
 try {
     # Repérage des colonnes par leur en-tête, avant le chargement de l'AD qui prend du temps
+    $lastNameColumn = 0
+    $firstNameColumn = 0
     $nameColumn = 0
     $mailColumn = 0
     $headers = @()
+    $wantedLastName = ConvertTo-NormalizedName $LastNameColumnHeader
+    $wantedFirstName = ConvertTo-NormalizedName $FirstNameColumnHeader
     $wantedName = ConvertTo-NormalizedName $NameColumnHeader
     $wantedMail = ConvertTo-NormalizedName $MailColumnHeader
     for ($c = 1; $c -le $workbook.LastColumn; $c++) {
         $text = Get-CellText $workbook $HeaderRow $c
         if ($text) { $headers += $text }
         $header = ConvertTo-NormalizedName $text
-        if (-not $nameColumn -and $header -eq $wantedName) { $nameColumn = $c }
+        if (-not $lastNameColumn -and $header -eq $wantedLastName) { $lastNameColumn = $c }
+        elseif (-not $firstNameColumn -and $header -eq $wantedFirstName) { $firstNameColumn = $c }
+        elseif (-not $nameColumn -and $header -eq $wantedName) { $nameColumn = $c }
         elseif (-not $mailColumn -and $header -eq $wantedMail) { $mailColumn = $c }
     }
-    if (-not $nameColumn) {
+    if ($lastNameColumn -and $firstNameColumn) {
+        $nameColumn = 0   # les colonnes séparées Nom / Prénom sont prioritaires
+    }
+    elseif (-not $nameColumn) {
         $found = if ($headers) { ($headers | Select-Object -First 10) -join ' | ' } else { '(aucun)' }
-        throw "Colonne '$NameColumnHeader' introuvable en ligne $HeaderRow de $inputFile. En-têtes trouvés : $found"
+        throw "Colonnes des noms introuvables en ligne $HeaderRow de $inputFile : il faut '$LastNameColumnHeader' et '$FirstNameColumnHeader', ou '$NameColumnHeader'. En-têtes trouvés : $found"
     }
     if (-not $mailColumn) {
         $mailColumn = $workbook.LastColumn + 1
@@ -361,7 +382,8 @@ try {
     [Array]::Sort($sortedKeys, [StringComparer]::Ordinal)
 
     for ($row = $HeaderRow + 1; $row -le $workbook.LastRow; $row++) {
-        $excelName = Get-CellText $workbook $row $nameColumn
+        if ($nameColumn) { $excelName = Get-CellText $workbook $row $nameColumn }
+        else { $excelName = ('{0} {1}' -f (Get-CellText $workbook $row $lastNameColumn), (Get-CellText $workbook $row $firstNameColumn)).Trim() }
         if (-not $excelName) { continue }
         $currentMail = Get-CellText $workbook $row $mailColumn
         $key = ConvertTo-NormalizedName $excelName
