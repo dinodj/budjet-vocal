@@ -251,19 +251,21 @@ function Close-Workbook {
 
 #region Chemins
 
-if (-not $Path) {
-    do {
+# Demande le fichier Excel tant que le chemin (fourni ou saisi) n'est pas valide
+$excelExtensions = '.xlsx', '.xlsm'
+while ($true) {
+    if (-not $Path) {
         # Un fichier glissé dans la fenêtre ou copié avec « Copier en tant que chemin d'accès » arrive entre guillemets
-        $Path = ([string](Read-Host "Chemin du fichier Excel (glissez le fichier dans cette fenêtre, Entrée vide pour quitter)")).Trim().Trim('"')
+        $Path = ([string](Read-Host "Chemin du fichier Excel à compléter (glissez le fichier .xlsx dans cette fenêtre, Entrée vide pour quitter)")).Trim().Trim('"')
         if (-not $Path) {
             Write-Host 'Abandon.'
             return
         }
-        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
-            Write-Warning "Fichier introuvable : $Path"
-            $Path = $null
-        }
-    } while (-not $Path)
+    }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { Write-Warning "Fichier introuvable : $Path" }
+    elseif ($excelExtensions -notcontains [IO.Path]::GetExtension($Path)) { Write-Warning "Ce n'est pas un fichier Excel .xlsx : $Path" }
+    else { break }
+    $Path = $null
 }
 $inputFile = (Resolve-Path -LiteralPath $Path).ProviderPath
 
@@ -281,79 +283,82 @@ $reportFile = Join-Path $OutputFolder ($baseName + '_rapport.csv')
 
 #endregion
 
-#region Chargement de l'AD
-
-Import-Module ActiveDirectory
-
-Write-Host "Chargement des utilisateurs de l'Active Directory..."
-$adParams = @{
-    Filter     = '*'
-    Properties = 'DisplayName', 'mail', 'proxyAddresses'
-}
-if ($SearchBase) { $adParams.SearchBase = $SearchBase }
-if ($Server) { $adParams.Server = $Server }
-
-$usersByDn = @{}
-$exactIndex = @{}   # nom normalisé -> DN des comptes
-$tokenIndex = @{}   # mots triés    -> DN des comptes
-
-foreach ($adUser in Get-ADUser @adParams) {
-    $mail = [string]$adUser.mail
-    if (-not $mail) {
-        $primary = @($adUser.proxyAddresses) -cmatch '^SMTP:' | Select-Object -First 1
-        if ($primary) { $mail = $primary.Substring(5) }
-    }
-
-    $dn = $adUser.DistinguishedName
-    $usersByDn[$dn] = [pscustomobject]@{
-        SamAccountName    = $adUser.SamAccountName
-        Enabled           = [bool]$adUser.Enabled
-        Mail              = $mail
-        DistinguishedName = $dn
-    }
-
-    $surname = ConvertTo-NormalizedName $adUser.Surname
-    $givenName = ConvertTo-NormalizedName $adUser.GivenName
-    $names = @((ConvertTo-NormalizedName $adUser.DisplayName), (ConvertTo-NormalizedName $adUser.Name))
-    if ($surname -and $givenName) { $names += "$surname $givenName", "$givenName $surname" }
-
-    foreach ($name in $names) {
-        Add-IndexEntry $exactIndex $name $dn
-        Add-IndexEntry $tokenIndex (Get-SortedTokenKey $name) $dn
-    }
-}
-
-if ($usersByDn.Count -eq 0) { throw "Aucun utilisateur trouvé dans l'AD (SearchBase : '$SearchBase')." }
-Write-Host "$($usersByDn.Count) comptes chargés."
-
-$sortedKeys = [string[]]@($exactIndex.Keys)
-[Array]::Sort($sortedKeys, [StringComparer]::Ordinal)
-
-#endregion
-
-#region Traitement du fichier Excel
+#region Traitement
 
 Write-Host "Lecture de $inputFile..."
 $workbook = Open-Workbook -FullPath $inputFile -SheetName $WorksheetName
 $results = New-Object System.Collections.Generic.List[object]
 
 try {
-    # Repérage des colonnes par leur en-tête
+    # Repérage des colonnes par leur en-tête, avant le chargement de l'AD qui prend du temps
     $nameColumn = 0
     $mailColumn = 0
+    $headers = @()
     $wantedName = ConvertTo-NormalizedName $NameColumnHeader
     $wantedMail = ConvertTo-NormalizedName $MailColumnHeader
     for ($c = 1; $c -le $workbook.LastColumn; $c++) {
-        $header = ConvertTo-NormalizedName (Get-CellText $workbook $HeaderRow $c)
+        $text = Get-CellText $workbook $HeaderRow $c
+        if ($text) { $headers += $text }
+        $header = ConvertTo-NormalizedName $text
         if (-not $nameColumn -and $header -eq $wantedName) { $nameColumn = $c }
         elseif (-not $mailColumn -and $header -eq $wantedMail) { $mailColumn = $c }
     }
-    if (-not $nameColumn) { throw "Colonne '$NameColumnHeader' introuvable en ligne $HeaderRow." }
+    if (-not $nameColumn) {
+        $found = if ($headers) { ($headers | Select-Object -First 10) -join ' | ' } else { '(aucun)' }
+        throw "Colonne '$NameColumnHeader' introuvable en ligne $HeaderRow de $inputFile. En-têtes trouvés : $found"
+    }
     if (-not $mailColumn) {
         $mailColumn = $workbook.LastColumn + 1
         Set-CellText $workbook $HeaderRow $mailColumn $MailColumnHeader
         Write-Warning "Colonne '$MailColumnHeader' absente : créée en colonne $mailColumn."
     }
+
+    # Chargement de l'AD
+    Import-Module ActiveDirectory
+
+    Write-Host "Chargement des utilisateurs de l'Active Directory..."
+    $adParams = @{
+        Filter     = '*'
+        Properties = 'DisplayName', 'mail', 'proxyAddresses'
+    }
+    if ($SearchBase) { $adParams.SearchBase = $SearchBase }
+    if ($Server) { $adParams.Server = $Server }
+
+    $usersByDn = @{}
+    $exactIndex = @{}   # nom normalisé -> DN des comptes
+    $tokenIndex = @{}   # mots triés    -> DN des comptes
+
+    foreach ($adUser in Get-ADUser @adParams) {
+        $mail = [string]$adUser.mail
+        if (-not $mail) {
+            $primary = @($adUser.proxyAddresses) -cmatch '^SMTP:' | Select-Object -First 1
+            if ($primary) { $mail = $primary.Substring(5) }
+        }
+
+        $dn = $adUser.DistinguishedName
+        $usersByDn[$dn] = [pscustomobject]@{
+            SamAccountName    = $adUser.SamAccountName
+            Enabled           = [bool]$adUser.Enabled
+            Mail              = $mail
+            DistinguishedName = $dn
+        }
+
+        $surname = ConvertTo-NormalizedName $adUser.Surname
+        $givenName = ConvertTo-NormalizedName $adUser.GivenName
+        $names = @((ConvertTo-NormalizedName $adUser.DisplayName), (ConvertTo-NormalizedName $adUser.Name))
+        if ($surname -and $givenName) { $names += "$surname $givenName", "$givenName $surname" }
+
+        foreach ($name in $names) {
+            Add-IndexEntry $exactIndex $name $dn
+            Add-IndexEntry $tokenIndex (Get-SortedTokenKey $name) $dn
+        }
+    }
+
+    if ($usersByDn.Count -eq 0) { throw "Aucun utilisateur trouvé dans l'AD (SearchBase : '$SearchBase')." }
+    Write-Host "$($usersByDn.Count) comptes chargés."
+
+    $sortedKeys = [string[]]@($exactIndex.Keys)
+    [Array]::Sort($sortedKeys, [StringComparer]::Ordinal)
 
     for ($row = $HeaderRow + 1; $row -le $workbook.LastRow; $row++) {
         $excelName = Get-CellText $workbook $row $nameColumn
