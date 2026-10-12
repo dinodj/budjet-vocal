@@ -2,11 +2,11 @@
 
 <#
 .SYNOPSIS
-    Audit et offboarding : comptes AD, boites aux lettres, listes de distribution,
-    delegations sur boites aux lettres et licences applicatives.
+    Audit et offboarding : comptes AD, boites aux lettres (dont mise en litige),
+    listes de distribution, delegations, licences Microsoft 365 et applicatives.
 
 .DESCRIPTION
-    Version 5.1 - analyses CIBLEES, VISIBLES et ACCELEREES :
+    Version 5.2 - analyses CIBLEES, VISIBLES et ACCELEREES :
       - seuls les UPN trouves dans AD sont analyses dans Exchange, et seuls
         ceux qui ont un objet Exchange sont recherches dans les DL et les
         delegations. Si aucun utilisateur n'est concerne, le scan est saute (la
@@ -18,7 +18,12 @@
         accelere par un cache local et par le choix automatique de la cmdlet
         la plus rapide. Les boites ou un utilisateur est trouve sont toujours
         relues en direct ;
-      - les boites aux lettres accessibles sont listees par utilisateur.
+      - les boites aux lettres accessibles sont listees par utilisateur ;
+      - ALERTE si la boite de l'utilisateur est en litige (Litigation Hold),
+        et etiquette [LITIGE] sur les boites accessibles concernees ;
+      - licences Microsoft 365 (Microsoft Graph, avec le groupe qui les
+        attribue) et licences applicatives avec leur type (colonnes des
+        fichiers Excel : produit, type de licence...).
 
     Ordre d'execution : delegations, DL, groupes AD, puis desactivation.
     La desactivation n'a lieu que si les etapes precedentes ont reussi (voir
@@ -45,8 +50,9 @@
     .\Offboarding-Audit.ps1 -InputFile C:\Temp\departs.csv -WhatIf
 
 .NOTES
-    Version    : 5.1
+    Version    : 5.2
     Prerequis  : ActiveDirectory, ExchangeOnlineManagement v2+
+                 Microsoft.Graph.Authentication (facultatif, licences Microsoft 365)
     Compatible : Windows PowerShell 5.1
 #>
 
@@ -84,9 +90,18 @@ $BulkMailboxThreshold           = 300   # au-dela, un seul Get-EXOMailbox pour t
 $MaxRetries                     = 3
 $RetryBaseDelayMs               = 2000
 
+# Licences Microsoft 365 via Microsoft Graph (module Microsoft.Graph.Authentication).
+# GroupMember.Read.All sert seulement a nommer le groupe qui attribue une licence.
+$ShowM365Licenses               = $true
+$GraphScopes                    = @('User.Read.All', 'GroupMember.Read.All')
+$LicenseNamesCsvUrl             = 'https://download.microsoft.com/download/e/3/e/e3e9faf2-f28b-490a-9ada-c6089a1fc5b0/Product%20names%20and%20service%20plan%20identifiers%20for%20licensing.csv'
+# Colonnes des fichiers de licences applicatives decrivant le type de licence.
+$LicenseTypeColumnPattern       = 'licen|produit|product|logiciel|software|offre|abonnement|subscription|edition|type|plan'
+
 $TargetSecurityGroupName        = 'GrpSecu-Utilisateurs_POWERPDF'
 $FullAccessCachePath            = Join-Path $ExportRoot 'Cache_FullAccess.clixml'
 $script:FullAccessCache         = $null
+$script:GraphConnectedHere      = $false
 
 $ProtectedGroupPatterns         = @(
     ',CN=Builtin,',
@@ -101,8 +116,8 @@ $LicenseFiles = @(
 
 # Proprietes hors jeu par defaut de Get-EXOMailbox (UPN, SMTP, Alias, Name,
 # DN, Guid, EmailAddresses, RecipientTypeDetails... sont toujours renvoyes).
-$MailboxProperties   = @('LitigationHoldEnabled', 'InPlaceHolds', 'ForwardingAddress',
-                         'ForwardingSmtpAddress', 'DeliverToMailboxAndForward')
+$MailboxProperties   = @('LitigationHoldEnabled', 'LitigationHoldDate', 'LitigationHoldOwner', 'LitigationHoldDuration',
+                         'InPlaceHolds', 'ForwardingAddress', 'ForwardingSmtpAddress', 'DeliverToMailboxAndForward')
 
 $UpnPattern          = '^[^@\s]+@[^@\s]+\.[^@\s]+$'
 $EmailRegex          = [regex]'[\w.+-]+@[\w-]+(?:\.[\w-]+)+'
@@ -112,6 +127,7 @@ $NonRetryablePattern = "couldn't be found|could not be found|can't be found|cann
                        "impossible de trouver|introuvable|n'existe pas|isn't a member|is not a member|" +
                        "n'est pas membre|already|existe d.j.|synchroni[sz]|access ?denied|acc.s refus.|" +
                        "sufficient permission|insufficient|droits? insuffisants|unauthorized|non autoris|" +
+                       "does not exist|forbidden|\b40[34]\b|" +
                        "isn't valid|n'est pas valide|cannot bind|impossible de lier"
 
 # ====================================================================
@@ -123,6 +139,7 @@ $NonRetryablePattern = "couldn't be found|could not be found|can't be found|cann
 function Get-Prop {
     param($InputObject, [Parameter(Mandatory)][string]$Name)
     if ($null -eq $InputObject) { return $null }
+    if ($InputObject -is [System.Collections.IDictionary]) { return $InputObject[$Name] }
     $p = $InputObject.PSObject.Properties[$Name]
     if ($p) { return $p.Value }
     return $null
@@ -287,7 +304,10 @@ function New-WorkItem {
         Delegations                      = @()
         DelegationsToRemove              = @()
         DelegationDecision               = ''
-        Licenses                         = @()
+        LitigationHold                   = ''         # detail de la mise en litige, vide sinon
+        AppLicenses                      = @()
+        M365Licenses                     = @()
+        M365Checked                      = $false
         Anomalies                        = @()
         Errors                           = @()
         Journal                          = @()
@@ -339,11 +359,40 @@ function Resolve-ADAccounts {
 # EXCHANGE : BOITES AUX LETTRES, REGLES INBOX, DL
 # ====================================================================
 
+function Format-LitigationHold {
+    param([Parameter(Mandatory)]$Mailbox)
+    $parts = @()
+    $date = Get-Prop $Mailbox 'LitigationHoldDate'
+    if ($date) { $parts += 'depuis le ' + $(if ($date -is [datetime]) { $date.ToString('yyyy-MM-dd') } else { "$date" }) }
+    $owner = "$(Get-Prop $Mailbox 'LitigationHoldOwner')"
+    if ($owner) { $parts += "par $owner" }
+    $duration = "$(Get-Prop $Mailbox 'LitigationHoldDuration')"
+    if ($duration) {
+        $ts = [TimeSpan]::Zero
+        $parts += $(if ($duration -match 'unlimited') { 'duree illimitee' }
+                    elseif ([TimeSpan]::TryParse($duration, [ref]$ts)) { "duree $([int]$ts.TotalDays) jours" }
+                    else { "duree $duration" })
+    }
+    return (@('actif') + $parts) -join ', '
+}
+
+function Show-LitigationAlert {
+    param([Parameter(Mandatory)][object[]]$Items)
+    Write-Host "`n################### ALERTE : MISE EN LITIGE ###################" -ForegroundColor Red
+    foreach ($it in $Items) { Write-Host "  $($it.UPN) : Litigation Hold $($it.LitigationHold)" -ForegroundColor Red }
+    Write-Host '  -> Boite sous conservation legale : prevenir le juridique / la conformite' -ForegroundColor Red
+    Write-Host '     avant toute suppression du compte, de la boite ou de sa licence.' -ForegroundColor Red
+    Write-Host "###############################################################" -ForegroundColor Red
+}
+
 function Add-MailboxAnomalies {
     param([Parameter(Mandatory)]$Item)
     $m = $Item.Mailbox
 
-    if (Get-Prop $m 'LitigationHoldEnabled') { $Item.Anomalies += '[!] LitigationHoldEnabled = True' }
+    if (Get-Prop $m 'LitigationHoldEnabled') {
+        $Item.LitigationHold = Format-LitigationHold $m
+        $Item.Anomalies     += "[!] MISE EN LITIGE : Litigation Hold $($Item.LitigationHold)"
+    }
     $holds = @(Get-PropValues $m 'InPlaceHolds')
     if ($holds.Count) { $Item.Anomalies += '[!] InPlaceHolds : ' + ($holds -join ', ') }
     foreach ($p in 'ForwardingAddress', 'ForwardingSmtpAddress') {
@@ -489,9 +538,10 @@ function ConvertTo-MailboxRef {
     $id = "$(Get-Prop $Recipient 'PrimarySmtpAddress')"
     if (-not $id) { $id = "$(Get-Prop $Recipient 'Identity')" }
     [pscustomobject]@{
-        MailboxId   = $id
-        DisplayName = "$(Get-Prop $Recipient 'DisplayName')"
-        Type        = "$(Get-Prop $Recipient 'RecipientTypeDetails')"
+        MailboxId      = $id
+        DisplayName    = "$(Get-Prop $Recipient 'DisplayName')"
+        Type           = "$(Get-Prop $Recipient 'RecipientTypeDetails')"
+        LitigationHold = [bool](Get-Prop $Recipient 'LitigationHoldEnabled')
     }
 }
 
@@ -499,6 +549,7 @@ function Format-MailboxLabel {
     param([Parameter(Mandatory)]$Delegation)
     $label = "$($Delegation.MailboxDisplayName) <$($Delegation.MailboxId)>"
     if ($Delegation.MailboxType) { $label += " [$($Delegation.MailboxType)]" }
+    if ($Delegation.MailboxLitigationHold) { $label += ' [LITIGE]' }
     return $label
 }
 
@@ -510,6 +561,7 @@ function Add-Delegation {
         MailboxId          = $Mailbox.MailboxId
         MailboxDisplayName = $Mailbox.DisplayName
         MailboxType        = $Mailbox.Type
+        MailboxLitigationHold = [bool](Get-Prop $Mailbox 'LitigationHold')
         PermissionType     = $Type
         CacheKey           = $CacheKey
     }
@@ -523,7 +575,7 @@ function Resolve-RecipientRef {
     if (-not $k) { return $null }   # une identite vide renverrait TOUS les destinataires
     if (-not $Lookup.ContainsKey($k)) {
         try { $Lookup[$k] = ConvertTo-MailboxRef (@(Invoke-WithRetry { Get-Recipient -Identity $Identity -ErrorAction Stop -WarningAction SilentlyContinue })[0]) }
-        catch { $Lookup[$k] = [pscustomobject]@{ MailboxId = $Identity; DisplayName = $Identity; Type = '' } }
+        catch { $Lookup[$k] = [pscustomobject]@{ MailboxId = $Identity; DisplayName = $Identity; Type = ''; LitigationHold = $false } }
     }
     return $Lookup[$k]
 }
@@ -633,11 +685,7 @@ function Update-FullAccessCache {
         }
         if ($null -eq $aces) { $failures += "$($mb.DisplayName) : $lastError"; continue }
 
-        $ref = ConvertTo-MailboxRef $mb
         $cache.Mailboxes[(Get-MailboxCacheKey $mb)] = [pscustomobject]@{
-            MailboxId   = $ref.MailboxId
-            DisplayName = $ref.DisplayName
-            Type        = $ref.Type
             ScannedUtc  = (Get-Date).ToUniversalTime()
             Users       = @($aces | Where-Object {
                                 -not (Get-Prop $_ 'IsInherited') -and -not (Get-Prop $_ 'Deny') -and
@@ -677,11 +725,11 @@ function Find-FullAccessDelegations {
     $script:FullAccessCache = Import-FullAccessCache
     $entries = $script:FullAccessCache.Mailboxes
     try {
-        $mailboxes = @(Get-EXOMailbox -RecipientTypeDetails $FullAccessMailboxTypes -ResultSize Unlimited -Properties WhenChangedUTC -ErrorAction Stop -WarningAction SilentlyContinue)
+        $mailboxes = @(Get-EXOMailbox -RecipientTypeDetails $FullAccessMailboxTypes -ResultSize Unlimited -Properties LitigationHoldEnabled, WhenChangedUTC -ErrorAction Stop -WarningAction SilentlyContinue)
     }
     catch {
         # WhenChangedUTC indisponible : le cache ne se fie alors qu'a son age.
-        $mailboxes = @(Get-EXOMailbox -RecipientTypeDetails $FullAccessMailboxTypes -ResultSize Unlimited -ErrorAction Stop -WarningAction SilentlyContinue)
+        $mailboxes = @(Get-EXOMailbox -RecipientTypeDetails $FullAccessMailboxTypes -ResultSize Unlimited -Properties LitigationHoldEnabled -ErrorAction Stop -WarningAction SilentlyContinue)
     }
 
     # A relire : boites absentes du cache, modifiees depuis, ou analysees il y a trop longtemps.
@@ -712,9 +760,9 @@ function Find-FullAccessDelegations {
                  Where-Object { -not $scanned.ContainsKey($_) } | ForEach-Object { $byCacheKey[$_] })
     if ($recheck.Count) { $failures += @(Update-FullAccessCache $recheck) }
 
+    # Nom, adresse et litige viennent de l'inventaire du jour, pas du cache.
     foreach ($hit in @(Get-FullAccessHits $index)) {
-        $e = $entries[$hit.CacheKey]
-        Add-Delegation $ByKey[$hit.ItemKey] ([pscustomobject]@{ MailboxId = $e.MailboxId; DisplayName = $e.DisplayName; Type = $e.Type }) 'FullAccess' $hit.CacheKey
+        Add-Delegation $ByKey[$hit.ItemKey] (ConvertTo-MailboxRef $byCacheKey[$hit.CacheKey]) 'FullAccess' $hit.CacheKey
     }
     Save-FullAccessCache
     return $failures
@@ -757,14 +805,29 @@ function Remove-MailboxDelegation {
 # LICENCES
 # ====================================================================
 
-# Texte de chaque feuille d'un .xlsx, lu directement dans l'archive OpenXML :
-# ni Excel (COM) ni module ImportExcel requis. Autres extensions : texte brut.
-function Get-WorkbookText {
+function ConvertFrom-ColumnLetters {
+    param([string]$Letters)
+    $n = 0
+    foreach ($ch in $Letters.ToUpperInvariant().ToCharArray()) { $n = $n * 26 + ([int]$ch - 64) }
+    return $n - 1
+}
+
+# Lignes de chaque feuille d'un .xlsx (tableaux de cellules, dans l'ordre des
+# colonnes), lues directement dans l'archive OpenXML : ni Excel (COM) ni module
+# ImportExcel requis. CSV / TXT : une feuille, separateur ; , ou tabulation.
+function Get-WorkbookRows {
     param([Parameter(Mandatory)][string]$Path)
 
-    $ext = [IO.Path]::GetExtension($Path).ToLowerInvariant()
+    $ext  = [IO.Path]::GetExtension($Path).ToLowerInvariant()
+    $rows = New-Object System.Collections.Generic.List[object]
     if ($ext -eq '.xls') { throw 'Format .xls non pris en charge : enregistrer le fichier en .xlsx.' }
-    if ($ext -ne '.xlsx') { return [pscustomobject]@{ Sheet = ''; Text = [IO.File]::ReadAllText($Path) } }
+    if ($ext -ne '.xlsx') {
+        $lines = @([IO.File]::ReadAllLines($Path) | Where-Object { $_.Trim() })
+        $delim = ';'
+        if ($lines.Count) { foreach ($d in ';', ',', "`t") { if ($lines[0].Contains($d)) { $delim = $d; break } } }
+        foreach ($l in $lines) { $rows.Add([string[]]@($l -split [regex]::Escape($delim) | ForEach-Object { $_.Trim().Trim('"') })) }
+        return [pscustomobject]@{ Sheet = ''; Rows = $rows }
+    }
 
     Add-Type -AssemblyName System.IO.Compression
     # FileShare.ReadWrite : le classeur peut rester ouvert dans Excel.
@@ -793,15 +856,24 @@ function Get-WorkbookText {
             $data   = & $readXml $(if ($target.StartsWith('/')) { $target.TrimStart('/') } else { "xl/$target" })
             if (-not $data) { continue }
 
-            $values = foreach ($cell in @($data.SelectNodes("//*[local-name()='c']"))) {
-                $v = $cell.SelectSingleNode("*[local-name()='v']")
-                switch ($cell.GetAttribute('t')) {
-                    's'         { if ($v) { $shared[[int]$v.InnerText] } }
-                    'inlineStr' { $cell.InnerText }
-                    default     { if ($v) { $v.InnerText } }
+            $rows = New-Object System.Collections.Generic.List[object]
+            foreach ($row in @($data.SelectNodes("//*[local-name()='row']"))) {
+                $cells = @{}; $next = 0
+                foreach ($cell in @($row.SelectNodes("*[local-name()='c']"))) {
+                    $col  = if ($cell.GetAttribute('r') -match '^([A-Za-z]+)') { ConvertFrom-ColumnLetters $Matches[1] } else { $next }
+                    $next = $col + 1
+                    $v    = $cell.SelectSingleNode("*[local-name()='v']")
+                    $cells[$col] = switch ($cell.GetAttribute('t')) {
+                        's'         { if ($v) { $shared[[int]$v.InnerText] } }
+                        'inlineStr' { $cell.InnerText }
+                        default     { if ($v) { $v.InnerText } }
+                    }
                 }
+                if (-not $cells.Count) { continue }
+                $max = ($cells.Keys | Measure-Object -Maximum).Maximum
+                $rows.Add([string[]]@(0..$max | ForEach-Object { if ($cells.ContainsKey($_)) { "$($cells[$_])".Trim() } else { '' } }))
             }
-            [pscustomobject]@{ Sheet = $sheet.GetAttribute('name'); Text = (@($values) -join "`n") }
+            [pscustomobject]@{ Sheet = $sheet.GetAttribute('name'); Rows = $rows }
         }
     }
     finally {
@@ -810,25 +882,166 @@ function Get-WorkbookText {
     }
 }
 
-# Adresse (minuscules) -> libelles "Editeur (feuille X)".
+<#
+    Adresse (minuscules) -> libelles "Editeur (feuille X) - Produit : ..., Type : ...".
+    Le type de licence vient des colonnes dont l'en-tete l'evoque
+    ($LicenseTypeColumnPattern). L'en-tete retenu est la derniere ligne sans
+    adresse avant les donnees (une ligne de titre au-dessus est ignoree). Sans
+    en-tete, les autres cellules de la ligne sont reprises.
+#>
 function New-LicenseIndex {
     param([object[]]$Files)
     $index = @{}
     foreach ($lf in @($Files)) {
         if (-not (Test-Path -LiteralPath $lf.Path -PathType Leaf)) { Write-Warning "[Licences] Fichier absent : $($lf.Path)"; continue }
-        try { $sheets = @(Get-WorkbookText $lf.Path) }
+        try { $sheets = @(Get-WorkbookRows $lf.Path) }
         catch { Write-Warning "[Licences] Lecture impossible de $($lf.Path) : $($_.Exception.Message)"; continue }
 
         foreach ($s in $sheets) {
-            $label = if ($s.Sheet) { "$($lf.Name) (feuille $($s.Sheet))" } else { $lf.Name }
-            foreach ($m in $EmailRegex.Matches($s.Text)) {
-                $k = $m.Value.ToLowerInvariant()
-                if (-not $index.ContainsKey($k)) { $index[$k] = @() }
-                if ($index[$k] -notcontains $label) { $index[$k] += $label }
+            $label  = if ($s.Sheet) { "$($lf.Name) (feuille $($s.Sheet))" } else { $lf.Name }
+            $header = $null; $typeCols = @(); $dataStarted = $false
+            foreach ($row in $s.Rows) {
+                $emails = @($EmailRegex.Matches(($row -join ' ')) | ForEach-Object { $_.Value.ToLowerInvariant() } | Sort-Object -Unique)
+                if (-not $emails.Count) {
+                    if (-not $dataStarted -and @($row | Where-Object { $_ }).Count) {
+                        $header   = $row
+                        $typeCols = @(for ($c = 0; $c -lt $row.Count; $c++) { if ($row[$c] -match $LicenseTypeColumnPattern) { $c } })
+                    }
+                    continue
+                }
+                $dataStarted = $true
+                $details = @(if ($typeCols.Count) { $typeCols | Where-Object { $_ -lt $row.Count -and $row[$_] } | ForEach-Object { "$($header[$_]) : $($row[$_])" } }
+                             elseif ($null -eq $header) { $row | Where-Object { $_ -and $_ -notmatch '@' } | Select-Object -First 3 })
+                $entry = if ($details.Count) { "$label - $($details -join ', ')" } else { $label }
+                foreach ($k in $emails) {
+                    if (-not $index.ContainsKey($k)) { $index[$k] = @() }
+                    if ($index[$k] -notcontains $entry) { $index[$k] += $entry }
+                }
             }
         }
     }
     return $index
+}
+
+# ---------- Licences Microsoft 365 (Microsoft Graph) ---------------
+
+# Noms officiels des references les plus courantes (doc Microsoft, aout 2026).
+# Les autres viennent du CSV Microsoft, ou a defaut restent en code brut.
+$script:BuiltInSkuNames = @{
+    'STANDARDPACK' = 'Office 365 E1'; 'ENTERPRISEPACK' = 'Office 365 E3'; 'ENTERPRISEPREMIUM' = 'Office 365 E5'
+    'Office_365_E3_(no_Teams)' = 'Office 365 E3 (no Teams)'; 'DESKLESSPACK' = 'Office 365 F3'
+    'SPE_E3' = 'Microsoft 365 E3'; 'SPE_E5' = 'Microsoft 365 E5'; 'SPE_F1' = 'Microsoft 365 F3'; 'M365_F1' = 'Microsoft 365 F1'
+    'Microsoft_365_E3_(no_Teams)' = 'Microsoft 365 E3 (no Teams)'; 'Microsoft_365_E5_(no_Teams)' = 'Microsoft 365 E5 (no Teams)'
+    'SPB' = 'Microsoft 365 Business Premium'; 'O365_BUSINESS_PREMIUM' = 'Microsoft 365 Business Standard'
+    'O365_BUSINESS_ESSENTIALS' = 'Microsoft 365 Business Basic'; 'O365_BUSINESS' = 'Microsoft 365 Apps for Business'
+    'OFFICESUBSCRIPTION' = 'Microsoft 365 Apps for enterprise'
+    'EXCHANGESTANDARD' = 'Exchange Online (Plan 1)'; 'EXCHANGEENTERPRISE' = 'Exchange Online (Plan 2)'
+    'EXCHANGEDESKLESS' = 'Exchange Online Kiosk'; 'EXCHANGEARCHIVE_ADDON' = 'Exchange Online Archiving for Exchange Online'
+    'EMS' = 'Enterprise Mobility + Security E3'; 'EMSPREMIUM' = 'Enterprise Mobility + Security E5'
+    'AAD_PREMIUM' = 'Microsoft Entra ID P1'; 'AAD_PREMIUM_P2' = 'Microsoft Entra ID P2'; 'INTUNE_A' = 'Intune'
+    'ATP_ENTERPRISE' = 'Microsoft Defender for Office 365 (Plan 1)'; 'THREAT_INTELLIGENCE' = 'Microsoft Defender for Office 365 (Plan 2)'
+    'WIN_DEF_ATP' = 'Microsoft Defender for Endpoint'; 'RIGHTSMANAGEMENT' = 'Azure Information Protection Plan 1'
+    'POWER_BI_PRO' = 'Power BI Pro'; 'POWER_BI_STANDARD' = 'Microsoft Fabric (Free)'; 'PBI_PREMIUM_PER_USER' = 'Power BI Premium Per User'
+    'FLOW_FREE' = 'Microsoft Power Automate Free'; 'FLOW_PER_USER' = 'Power Automate per user plan'
+    'POWERAPPS_PER_USER' = 'Power Apps Premium'; 'POWERAPPS_DEV' = 'Microsoft PowerApps for Developer'
+    'PROJECT_P1' = 'Planner Plan 1'; 'PROJECTPROFESSIONAL' = 'Planner and Project Plan 3'; 'PROJECTPREMIUM' = 'Project Online Premium'
+    'VISIOONLINE_PLAN1' = 'Visio Plan 1'; 'VISIOCLIENT' = 'Visio Plan 2'
+    'MCOEV' = 'Microsoft Teams Phone Standard'; 'MCOMEETADV' = 'Microsoft 365 Audio Conferencing'
+    'PHONESYSTEM_VIRTUALUSER' = 'Microsoft Teams Phone Resource Account'
+    'TEAMS_EXPLORATORY' = 'Microsoft Teams Exploratory'; 'Microsoft_Teams_Enterprise_New' = 'Microsoft Teams Enterprise'
+    'Microsoft_365_Copilot' = 'Copilot for Microsoft 365'; 'STREAM' = 'Microsoft Stream'
+}
+
+# Table integree completee par le CSV officiel Microsoft (telecharge, puis
+# reutilise 30 jours). Hors ligne, la table integree suffit.
+function Get-SkuDisplayNames {
+    $names = @{}
+    foreach ($k in $script:BuiltInSkuNames.Keys) { $names[$k] = $script:BuiltInSkuNames[$k] }
+    if (-not $LicenseNamesCsvUrl) { return $names }
+    $path = Join-Path $ExportRoot 'M365_LicenseNames.csv'
+    try {
+        if (-not (Test-Path -LiteralPath $path) -or (Get-Item -LiteralPath $path).LastWriteTime -lt (Get-Date).AddDays(-30)) {
+            Invoke-WebRequest -Uri $LicenseNamesCsvUrl -OutFile "$path.tmp" -UseBasicParsing -TimeoutSec 15
+            Move-Item -LiteralPath "$path.tmp" -Destination $path -Force -WhatIf:$false
+        }
+        foreach ($row in @(Import-Csv -LiteralPath $path)) {
+            $id = "$(Get-Prop $row 'String_Id')"; $name = "$(Get-Prop $row 'Product_Display_Name')"
+            if ($id -and $name) { $names[$id] = $name }
+        }
+    }
+    catch { Write-Verbose "Noms officiels des licences indisponibles : $($_.Exception.Message)" }
+    return $names
+}
+
+function Connect-GraphIfNeeded {
+    if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Authentication)) {
+        Write-Warning 'Module Microsoft.Graph.Authentication absent : licences Microsoft 365 non affichees (Install-Module Microsoft.Graph.Authentication -Scope CurrentUser).'
+        return $false
+    }
+    Import-Module Microsoft.Graph.Authentication -ErrorAction Stop -WarningAction SilentlyContinue
+    if (Get-MgContext) { return $true }
+    $connectArgs = @{ Scopes = $GraphScopes }
+    if ((Get-Command Connect-MgGraph).Parameters.ContainsKey('NoWelcome')) { $connectArgs.NoWelcome = $true }
+    Connect-MgGraph @connectArgs | Out-Null
+    $script:GraphConnectedHere = $true
+    return $true
+}
+
+function Resolve-GraphGroupName {
+    param([string]$GroupId, [Parameter(Mandatory)][hashtable]$Cache)
+    if (-not $Cache.ContainsKey($GroupId)) {
+        try { $Cache[$GroupId] = "$(Get-Prop (Invoke-MgGraphRequest -Method GET -Uri ('v1.0/groups/{0}?$select=displayName' -f $GroupId) -ErrorAction Stop) 'displayName')" }
+        catch { $Cache[$GroupId] = $GroupId }   # droit GroupMember.Read.All absent : identifiant brut
+    }
+    return $Cache[$GroupId]
+}
+
+# Licences Microsoft 365 de chaque utilisateur, avec le groupe qui les attribue
+# le cas echeant : retirer ce groupe AD retire aussi la licence.
+function Add-M365Licenses {
+    param([Parameter(Mandatory)][object[]]$Items)
+    $names  = Get-SkuDisplayNames
+    $groups = @{}
+    $sw     = [Diagnostics.Stopwatch]::StartNew()
+    for ($i = 0; $i -lt $Items.Count; $i++) {
+        $it = $Items[$i]
+        Write-ScanProgress 'Licences Microsoft 365' ($i + 1) $Items.Count $sw $it.UPN
+        # L'ObjectId Entra (ExternalDirectoryObjectId) evite tout souci d'echappement de l'UPN.
+        $id = "$(Get-Prop $it.Recipient 'ExternalDirectoryObjectId')"
+        if (-not $id) { $id = [uri]::EscapeDataString($it.UPN) }
+        try {
+            $details = @(Get-Prop (Invoke-WithRetry { Invoke-MgGraphRequest -Method GET -Uri ('v1.0/users/{0}/licenseDetails?$select=skuId,skuPartNumber' -f $id) -ErrorAction Stop }) 'value' | Where-Object { $_ })
+            $states  = @()
+            try { $states = @(Get-Prop (Invoke-WithRetry { Invoke-MgGraphRequest -Method GET -Uri ('v1.0/users/{0}?$select=licenseAssignmentStates' -f $id) -ErrorAction Stop }) 'licenseAssignmentStates' | Where-Object { $_ }) }
+            catch { Write-Verbose "licenseAssignmentStates '$($it.UPN)' : $($_.Exception.Message)" }
+
+            $it.M365Licenses = @(foreach ($d in $details) {
+                $sku   = "$(Get-Prop $d 'skuPartNumber')"
+                $label = if ($names.ContainsKey($sku)) { "$($names[$sku]) ($sku)" } else { $sku }
+                $via   = @($states | Where-Object { "$(Get-Prop $_ 'skuId')" -eq "$(Get-Prop $d 'skuId')" -and (Get-Prop $_ 'assignedByGroup') } |
+                           ForEach-Object { Resolve-GraphGroupName "$(Get-Prop $_ 'assignedByGroup')" $groups })
+                if ($via.Count) { $label += " - via groupe $($via -join ', ')" }
+                $label
+            })
+            $it.M365Checked = $true
+        }
+        catch { $it.Anomalies += "[!] Lecture des licences Microsoft 365 impossible : $($_.Exception.Message)" }
+    }
+    Write-Progress -Activity 'Licences Microsoft 365' -Completed
+}
+
+function Show-LicenseReport {
+    param([Parameter(Mandatory)][object[]]$Items)
+    Write-Host "`n======================= LICENCES =======================" -ForegroundColor Cyan
+    foreach ($it in $Items) {
+        if (-not $it.M365Checked -and -not @($it.AppLicenses).Count) { continue }
+        Write-Host $it.UPN -ForegroundColor White
+        if ($it.M365Checked) {
+            $m365 = if (@($it.M365Licenses).Count) { @($it.M365Licenses) -join ' | ' } else { 'aucune' }
+            Write-Host "  Microsoft 365 : $m365"
+        }
+        foreach ($l in @($it.AppLicenses)) { Write-Host "  Applicative   : $l" -ForegroundColor Yellow }
+    }
 }
 
 # ====================================================================
@@ -839,6 +1052,7 @@ function Show-UserSummary {
     param([Parameter(Mandatory)]$Item)
 
     Write-Host "`n================ $($Item.UPN) ================" -ForegroundColor Cyan
+    if ($Item.LitigationHold) { Write-Host "!!! MISE EN LITIGE : Litigation Hold $($Item.LitigationHold) !!!" -ForegroundColor Red }
     $ad = $Item.ADUser
     Write-Host ("[AD] {0} | Actif : {1} | {2} groupe(s)" -f $ad.SamAccountName, $ad.Enabled, @($Item.ADGroupDNs).Count)
 
@@ -846,6 +1060,10 @@ function Show-UserSummary {
         Write-Host ("[Exchange] {0} | {1}" -f (Get-Prop $Item.Mailbox 'PrimarySmtpAddress'), (Get-Prop $Item.Mailbox 'RecipientTypeDetails'))
     }
     elseif ($Item.Recipient) { Write-Host "[Exchange] Pas de BAL - destinataire $(Get-Prop $Item.Recipient 'RecipientTypeDetails')" }
+
+    if ($Item.M365Checked) {
+        Write-Host ("[Licences Microsoft 365] {0}" -f $(if (@($Item.M365Licenses).Count) { @($Item.M365Licenses) -join ' | ' } else { 'aucune' }))
+    }
 
     if (@($Item.DLEntries).Count) {
         Write-Host ("[DL] {0} : {1}" -f @($Item.DLEntries).Count, (@($Item.DLEntries | ForEach-Object { $_.DisplayName }) -join ', '))
@@ -858,7 +1076,8 @@ function Show-UserSummary {
         Write-Host ("  {0}. {1} : {2}" -f $idx, (Format-MailboxLabel $p), $p.PermissionType) -ForegroundColor Red
     }
 
-    foreach ($a in @($Item.Anomalies)) { Write-Host "  $a" -ForegroundColor Yellow }
+    # La mise en litige est deja en bandeau en tete du resume.
+    foreach ($a in @($Item.Anomalies | Where-Object { $_ -notlike '`[!`] MISE EN LITIGE*' })) { Write-Host "  $a" -ForegroundColor Yellow }
 }
 
 function Select-DelegationRemoval {
@@ -978,7 +1197,9 @@ function ConvertTo-ExportRow {
         DecisionRetraitBAL        = $Item.DelegationDecision
         NbBALSelectionnees        = @($Item.DelegationsToRemove).Count
         EstMembrePowerPDF         = $(if ($Item.IsMemberOfPowerPDFGroup) { 'Oui' } else { 'Non' })
-        Licences                  = Join-Values $Item.Licenses
+        MiseEnLitige              = $(if ($Item.LitigationHold) { "Oui ($($Item.LitigationHold))" } else { 'Non' })
+        LicencesM365              = $(if (-not $Item.M365Checked) { '' } elseif (@($Item.M365Licenses).Count) { Join-Values $Item.M365Licenses } else { 'Aucune' })
+        LicencesApplicatives      = Join-Values $Item.AppLicenses
         Anomalies                 = Join-Values $Item.Anomalies
         ReglesInbox               = Join-Values $Item.InboxRuleFindings
         DecisionAnomalies         = $Item.DecisionAnomalies
@@ -1060,6 +1281,8 @@ try {
         $exoItems = @($adItems | Where-Object { $_.Recipient })
         Write-Host ("      {0} destinataire(s), dont {1} boite(s) aux lettres ({2})" -f
             $exoItems.Count, @($exoItems | Where-Object { $_.Mailbox }).Count, (Format-Duration $phase.Elapsed)) -ForegroundColor Gray
+        $onHold = @($exoItems | Where-Object { $_.LitigationHold })
+        if ($onHold.Count) { Show-LitigationAlert $onHold }
 
         # ---------------- 3. LISTES DE DISTRIBUTION -----------------
         if ($exoItems.Count) {
@@ -1117,16 +1340,24 @@ try {
     }
 
     # ---------------- 5. LICENCES -----------------------------------
-    $licenseIndex = New-LicenseIndex $LicenseFiles
-    $nbLic = 0
-    foreach ($it in $items) {
-        $it.Licenses = @($it.Addresses | Where-Object { $licenseIndex.ContainsKey($_) } | ForEach-Object { $licenseIndex[$_] } | Sort-Object -Unique)
-        if ($it.Licenses.Count) {
-            $nbLic++
-            if ($it.ADUser) { $it.Anomalies += '[!] Licence(s) : ' + ($it.Licenses -join ', ') }
+    Write-Host '[5/5] Licences...' -ForegroundColor Yellow
+    if ($ShowM365Licenses -and $adItems.Count) {
+        $phase = [Diagnostics.Stopwatch]::StartNew()
+        try {
+            if (Connect-GraphIfNeeded) {
+                Add-M365Licenses $adItems
+                Write-Host "      Microsoft 365 : termine ($(Format-Duration $phase.Elapsed))" -ForegroundColor Gray
+            }
         }
+        catch { Write-Warning "Licences Microsoft 365 indisponibles : $($_.Exception.Message)" }
     }
-    Write-Host "[5/5] Licences : $nbLic utilisateur(s) concerne(s)" -ForegroundColor Yellow
+    $licenseIndex = New-LicenseIndex $LicenseFiles
+    foreach ($it in $items) {
+        $it.AppLicenses = @($it.Addresses | Where-Object { $licenseIndex.ContainsKey($_) } | ForEach-Object { $licenseIndex[$_] } | Sort-Object -Unique)
+        if ($it.AppLicenses.Count -and $it.ADUser) { $it.Anomalies += '[!] Licence(s) applicative(s) : ' + ($it.AppLicenses -join ' | ') }
+    }
+    Write-Host "      Applicatives : $(@($items | Where-Object { @($_.AppLicenses).Count }).Count) utilisateur(s) concerne(s)" -ForegroundColor Gray
+    Show-LicenseReport $items
 
     # ---------------- REVUE : seulement les utilisateurs concernes ---
     # La liste numerotee des delegations sert au choix D (au cas par cas).
@@ -1146,6 +1377,8 @@ try {
     Write-Host "`n================ RESUME GLOBAL ================" -ForegroundColor Cyan
     Write-Host ("Total : {0} | Prets : {1} | Bloques : {2} | Introuvables AD : {3}" -f
         $items.Count, $ready.Count, ($adItems.Count - $ready.Count), ($items.Count - $adItems.Count))
+    $onHold = @($adItems | Where-Object { $_.LitigationHold })
+    if ($onHold.Count) { Write-Host "ALERTE - boite(s) en litige : $(@($onHold | ForEach-Object { $_.UPN }) -join ', ')" -ForegroundColor Red }
 
     $decision = 'N'
     if ($ready.Count) {
@@ -1155,6 +1388,7 @@ try {
                 GroupesAD   = @($_.ADGroupDNs | Where-Object { -not (Test-IsProtectedGroupDN $_) }).Count
                 DL          = @($_.DLEntries | Where-Object { -not (Get-Prop $_ 'IsDirSynced') }).Count
                 Delegations = '{0}/{1}' -f @($_.DelegationsToRemove).Count, @($_.Delegations).Count
+                Litige      = $(if ($_.LitigationHold) { 'OUI' } else { '' })
             }
         })
         $plan | Format-Table -AutoSize | Out-Host
@@ -1191,4 +1425,5 @@ catch {
 }
 finally {
     if ($exoConnectedHere) { try { Disconnect-ExchangeOnline -Confirm:$false -WhatIf:$false | Out-Null } catch {} }
+    if ($script:GraphConnectedHere) { try { Disconnect-MgGraph | Out-Null } catch {} }
 }
