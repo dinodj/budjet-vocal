@@ -5,19 +5,25 @@
 
 .DESCRIPTION
     Pour chaque ligne du fichier Excel, le script lit le nom de la personne, soit dans deux
-    colonnes « Nom » et « Prénom », soit dans une seule colonne « Nom et prénom » (format
-    « NOM PRENOM »), cherche l'utilisateur correspondant dans l'AD et écrit son adresse mail
-    dans la colonne « Mail Principal Syncro ».
+    colonnes « Nom » et « Prénom », soit dans une seule colonne « Nom et prénom », cherche
+    l'utilisateur correspondant dans l'AD et écrit son adresse mail dans la colonne
+    « Mail Principal Syncro ».
 
     L'AD est uniquement lu, jamais modifié. Le fichier source n'est pas modifié non plus :
     le résultat est enregistré dans un nouveau fichier <nom>_AD_<date>.xlsx du dossier
     -OutputFolder, avec un rapport CSV <nom>_AD_<date>_rapport.csv qui détaille chaque ligne.
 
-    Comparaison des noms (sans tenir compte de la casse, des accents, des tirets ni des apostrophes) :
-      1. Exacte         : « NOM PRENOM » ou « PRENOM NOM » (Surname / GivenName), DisplayName ou CN.
-      2. Ordre des mots : les mêmes mots dans un autre ordre (noms composés).
-      3. Approximative  : nom tronqué dans l'Excel (ex. « DUPONT JEAN-BAPTIST »). Ces lignes sont
-                          seulement signalées dans le rapport, sauf avec -IncludeApproximate.
+    Les noms sont comparés sans tenir compte de la casse, des accents (é, è, ç, ï, ñ...),
+    des apostrophes (' ’ `), des tirets ni des espaces, et le nom peut être à la place du
+    prénom. Correspondances essayées, de la plus sûre à la plus tolérante :
+      1. Exacte         : NOM PRENOM ou PRENOM NOM (Surname / GivenName), DisplayName ou CN.
+      2. Ordre des mots : les mêmes mots dans un autre ordre (noms et prénoms composés).
+      3. Sans espaces   : « D'HEROUVILLE » = « DHEROUVILLE », « JEAN-PIERRE » = « JEANPIERRE ».
+      4. Partielle      : même nom et même premier prénom, dans un sens ou dans l'autre
+                          (ex. « DUPONT Jean Marc » = compte « Jean Dupont »).
+      5. Approximative  : nom tronqué dans l'Excel (ex. « DUPONT JEAN-BAPTIST »).
+    Les correspondances 1 à 3 sont écrites directement. Les correspondances 4 et 5 sont
+    affichées à la fin et écrites seulement si vous confirmez (ou avec -IncludeApproximate).
 
     Adresse retenue : attribut « mail », sinon l'adresse SMTP principale (« SMTP: » dans
     proxyAddresses). Si plusieurs comptes correspondent, ceux qui sont activés et ont une
@@ -28,7 +34,7 @@
       OK              adresse écrite dans l'Excel
       DEJA OK         la cellule contenait déjà la même adresse
       DEJA RENSEIGNE  la cellule contenait une autre adresse, conservée (voir -Force)
-      A VERIFIER      correspondance approximative, non écrite (voir -IncludeApproximate)
+      A VERIFIER      correspondance partielle ou approximative, non confirmée
       AMBIGU          plusieurs comptes avec des adresses différentes, non écrite
       SANS MAIL       compte trouvé mais sans adresse mail
       NON TROUVE      aucun compte AD correspondant
@@ -69,7 +75,7 @@
     Remplace les adresses déjà présentes dans la colonne.
 
 .PARAMETER IncludeApproximate
-    Écrit aussi les adresses trouvées par correspondance approximative (nom tronqué).
+    Écrit les correspondances partielles et approximatives sans demander de confirmation.
 
 .EXAMPLE
     Double-cliquer sur Update-MailPrincipalSyncroFromAD.cmd (placé à côté de ce script) :
@@ -85,7 +91,7 @@
     Windows PowerShell 5.1. Prérequis :
       - module ActiveDirectory (RSAT) ;
       - module ImportExcel (Install-Module ImportExcel -Scope CurrentUser) ou, à défaut, Microsoft Excel.
-    Conserver ce fichier en UTF-8 avec BOM pour que les accents s'affichent correctement.
+    Enregistrer ce fichier en UTF-8 avec BOM pour que les accents s'affichent correctement.
 
     Erreur « n'est pas signé numériquement » : lancer le script par Update-MailPrincipalSyncroFromAD.cmd,
     ou par : powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Update-MailPrincipalSyncroFromAD.ps1
@@ -122,19 +128,21 @@ param(
 $ErrorActionPreference = 'Stop'
 
 # Affichée au lancement pour vérifier que c'est bien la dernière version du script qui tourne
-$scriptVersion = '2026-10-12 (colonnes Nom / Prénom)'
+$scriptVersion = '5 (2026-10-12)'
 Write-Host "Update-MailPrincipalSyncroFromAD - version $scriptVersion"
 
 #region Fonctions
 
 # Met un nom sous une forme comparable : majuscules, sans accents, mots séparés par un espace.
-# « Jean-Jacques D'Hérouville » -> « JEAN JACQUES D HEROUVILLE »
+# « Jean-Jacques D’Hérouville » -> « JEAN JACQUES D HEROUVILLE »
 function ConvertTo-NormalizedName {
     param([string]$Text)
     if ([string]::IsNullOrWhiteSpace($Text)) { return '' }
     $t = ($Text.Normalize([Text.NormalizationForm]::FormD) -replace '\p{Mn}+', '').ToUpperInvariant()
-    # Lettres sans décomposition Unicode : Œ, Æ, ß, Ø
-    $t = $t.Replace([string][char]0x0152, 'OE').Replace([string][char]0x00C6, 'AE').Replace([string][char]0x00DF, 'SS').Replace([string][char]0x00D8, 'O')
+    # Lettres sans décomposition Unicode : Œ, Æ, ß, Ø, Ł, Đ
+    $t = $t.Replace([string][char]0x0152, 'OE').Replace([string][char]0x00C6, 'AE').Replace([string][char]0x00DF, 'SS')
+    $t = $t.Replace([string][char]0x00D8, 'O').Replace([string][char]0x0141, 'L').Replace([string][char]0x0110, 'D')
+    # Apostrophes (' ’ ` ´), tirets, points, espaces insécables... -> un seul espace
     return ($t -creplace '[^A-Z0-9]+', ' ').Trim()
 }
 
@@ -159,6 +167,36 @@ function Add-IndexEntry {
 function Get-IndexEntry {
     param([hashtable]$Index, [string]$Key)
     if ($Key -and $Index.ContainsKey($Key)) { $Index[$Key] }
+}
+
+# Couples (nom, prénom) possibles pour une ligne, dans les deux sens : colonnes Nom / Prénom,
+# ou chaque découpage d'une colonne « NOM PRENOM ». Les noms sont déjà normalisés.
+function Get-NameSplit {
+    param([string]$LastName, [string]$FirstName, [string]$FullName)
+    if ($LastName -and $FirstName) {
+        [pscustomobject]@{ Last = $LastName; First = $FirstName }
+        [pscustomobject]@{ Last = $FirstName; First = $LastName }
+        return
+    }
+    $tokens = @($FullName.Split(' ') | Where-Object { $_ })
+    for ($i = 1; $i -lt $tokens.Count; $i++) {
+        $left = $tokens[0..($i - 1)] -join ' '
+        $right = $tokens[$i..($tokens.Count - 1)] -join ' '
+        [pscustomobject]@{ Last = $left; First = $right }
+        [pscustomobject]@{ Last = $right; First = $left }
+    }
+}
+
+# Comptes qui ont le même nom (sans espaces) et le même premier prénom.
+function Find-PartialEntry {
+    param([hashtable]$SurnameIndex, [hashtable]$Users, $Splits)
+    foreach ($split in $Splits) {
+        $firstToken = $split.First.Split(' ')[0]
+        if (-not $firstToken) { continue }
+        foreach ($dn in @(Get-IndexEntry $SurnameIndex $split.Last.Replace(' ', ''))) {
+            if ($Users[$dn].FirstGivenName -eq $firstToken) { $dn }
+        }
+    }
 }
 
 # Comptes dont le nom commence par le nom Excel (nom tronqué dans l'Excel).
@@ -350,8 +388,10 @@ try {
     if ($Server) { $adParams.Server = $Server }
 
     $usersByDn = @{}
-    $exactIndex = @{}   # nom normalisé -> DN des comptes
-    $tokenIndex = @{}   # mots triés    -> DN des comptes
+    $exactIndex = @{}     # nom normalisé                -> DN des comptes
+    $tokenIndex = @{}     # mots triés                   -> DN des comptes
+    $compactIndex = @{}   # nom sans espaces             -> DN des comptes
+    $surnameIndex = @{}   # nom de famille sans espaces  -> DN des comptes
 
     foreach ($adUser in Get-ADUser @adParams) {
         $mail = [string]$adUser.mail
@@ -360,23 +400,29 @@ try {
             if ($primary) { $mail = $primary.Substring(5) }
         }
 
+        $surname = ConvertTo-NormalizedName $adUser.Surname
+        $givenName = ConvertTo-NormalizedName $adUser.GivenName
+        $fullName = ('{0} {1}' -f $adUser.GivenName, $adUser.Surname).Trim()
+        if (-not $fullName) { $fullName = if ($adUser.DisplayName) { $adUser.DisplayName } else { $adUser.Name } }
+
         $dn = $adUser.DistinguishedName
         $usersByDn[$dn] = [pscustomobject]@{
             SamAccountName    = $adUser.SamAccountName
+            FullName          = $fullName
+            FirstGivenName    = $givenName.Split(' ')[0]
             Enabled           = [bool]$adUser.Enabled
             Mail              = $mail
             DistinguishedName = $dn
         }
 
-        $surname = ConvertTo-NormalizedName $adUser.Surname
-        $givenName = ConvertTo-NormalizedName $adUser.GivenName
         $names = @((ConvertTo-NormalizedName $adUser.DisplayName), (ConvertTo-NormalizedName $adUser.Name))
         if ($surname -and $givenName) { $names += "$surname $givenName", "$givenName $surname" }
-
         foreach ($name in $names) {
             Add-IndexEntry $exactIndex $name $dn
             Add-IndexEntry $tokenIndex (Get-SortedTokenKey $name) $dn
+            Add-IndexEntry $compactIndex $name.Replace(' ', '') $dn
         }
+        if ($surname) { Add-IndexEntry $surnameIndex $surname.Replace(' ', '') $dn }
     }
 
     if ($usersByDn.Count -eq 0) { throw "Aucun utilisateur trouvé dans l'AD (SearchBase : '$SearchBase')." }
@@ -386,13 +432,21 @@ try {
     [Array]::Sort($sortedKeys, [StringComparer]::Ordinal)
 
     for ($row = $HeaderRow + 1; $row -le $workbook.LastRow; $row++) {
-        if ($nameColumn) { $excelName = Get-CellText $workbook $row $nameColumn }
-        else { $excelName = ('{0} {1}' -f (Get-CellText $workbook $row $lastNameColumn), (Get-CellText $workbook $row $firstNameColumn)).Trim() }
+        $lastName = ''
+        $firstName = ''
+        if ($nameColumn) {
+            $excelName = Get-CellText $workbook $row $nameColumn
+        }
+        else {
+            $lastName = Get-CellText $workbook $row $lastNameColumn
+            $firstName = Get-CellText $workbook $row $firstNameColumn
+            $excelName = "$lastName $firstName".Trim()
+        }
         if (-not $excelName) { continue }
         $currentMail = Get-CellText $workbook $row $mailColumn
         $key = ConvertTo-NormalizedName $excelName
 
-        # Recherche du ou des comptes, de la correspondance la plus stricte à la plus tolérante
+        # Recherche du ou des comptes, de la correspondance la plus sûre à la plus tolérante
         $matchType = 'Exacte'
         $dns = @(Get-IndexEntry $exactIndex $key)
         if ($dns.Count -eq 0) {
@@ -400,9 +454,19 @@ try {
             $dns = @(Get-IndexEntry $tokenIndex (Get-SortedTokenKey $key))
         }
         if ($dns.Count -eq 0) {
+            $matchType = 'Sans espaces'
+            $dns = @(Get-IndexEntry $compactIndex $key.Replace(' ', ''))
+        }
+        if ($dns.Count -eq 0) {
+            $matchType = 'Partielle'
+            $splits = @(Get-NameSplit (ConvertTo-NormalizedName $lastName) (ConvertTo-NormalizedName $firstName) $key)
+            $dns = @(Find-PartialEntry $surnameIndex $usersByDn $splits | Select-Object -Unique)
+        }
+        if ($dns.Count -eq 0) {
             $matchType = 'Approximative'
             $dns = @(Find-PrefixEntry $sortedKeys $exactIndex $key | Select-Object -Unique)
         }
+        $needsConfirmation = $matchType -eq 'Partielle' -or $matchType -eq 'Approximative'
         $candidates = @($dns | ForEach-Object { $usersByDn[$_] })
 
         # Choix de l'adresse : comptes activés d'abord, puis désactivés
@@ -415,9 +479,9 @@ try {
         if ($candidates.Count -eq 0) { $status = 'NON TROUVE' }
         elseif ($distinctMails.Count -eq 0) { $status = 'SANS MAIL' }
         elseif ($distinctMails.Count -gt 1) { $status = 'AMBIGU' }
-        elseif ($matchType -eq 'Approximative' -and -not $IncludeApproximate) { $status = 'A VERIFIER' }
         elseif ($currentMail -and $currentMail -eq $chosen.Mail) { $status = 'DEJA OK' }
         elseif ($currentMail -and -not $Force) { $status = 'DEJA RENSEIGNE' }
+        elseif ($needsConfirmation -and -not $IncludeApproximate) { $status = 'A VERIFIER' }
         else {
             $status = 'OK'
             Set-CellText $workbook $row $mailColumn $chosen.Mail
@@ -429,14 +493,30 @@ try {
                 Statut           = $status
                 Correspondance   = if ($candidates.Count) { $matchType } else { '' }
                 MailAD           = if ($chosen) { $chosen.Mail } else { '' }
+                CompteAD         = if ($chosen) { $chosen.FullName } else { '' }
                 ValeurPrecedente = $currentMail
                 Compte           = if ($chosen) { $chosen.SamAccountName } else { '' }
                 CompteActive     = if ($chosen) { $chosen.Enabled } else { '' }
                 Candidats        = ($candidates | ForEach-Object {
-                        '{0} <{1}>{2}' -f $_.SamAccountName, $_.Mail, $(if ($_.Enabled) { '' } else { ' (désactivé)' })
+                        '{0} ({1}) <{2}>{3}' -f $_.SamAccountName, $_.FullName, $_.Mail, $(if ($_.Enabled) { '' } else { ' désactivé' })
                     }) -join ' ; '
                 DN               = if ($chosen) { $chosen.DistinguishedName } else { '' }
             })
+    }
+
+    # Correspondances partielles ou approximatives : écrites seulement après confirmation
+    $pending = @($results | Where-Object { $_.Statut -eq 'A VERIFIER' })
+    if ($pending.Count) {
+        Write-Host ''
+        Write-Host "$($pending.Count) correspondance(s) partielle(s) ou approximative(s) à confirmer :"
+        $pending | Format-Table Ligne, Nom, CompteAD, MailAD, Correspondance -AutoSize -Wrap | Out-Host
+        $answer = Read-Host 'Écrire aussi ces adresses dans le fichier Excel ? (O/N)'
+        if ($answer -match '^\s*[oOyY]') {
+            foreach ($result in $pending) {
+                Set-CellText $workbook $result.Ligne $mailColumn $result.MailAD
+                $result.Statut = 'OK'
+            }
+        }
     }
 
     $written = @($results | Where-Object Statut -eq 'OK').Count
