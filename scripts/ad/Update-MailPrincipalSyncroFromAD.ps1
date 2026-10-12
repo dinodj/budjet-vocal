@@ -121,6 +121,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Affichée au lancement pour vérifier que c'est bien la dernière version du script qui tourne
+$scriptVersion = '2026-10-12 (colonnes Nom / Prénom)'
+Write-Host "Update-MailPrincipalSyncroFromAD - version $scriptVersion"
+
 #region Fonctions
 
 # Met un nom sous une forme comparable : majuscules, sans accents, mots séparés par un espace.
