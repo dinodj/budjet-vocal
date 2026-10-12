@@ -3,21 +3,24 @@
 <#
 .SYNOPSIS
     Audit et offboarding : comptes AD, boites aux lettres, listes de distribution,
-    delegations sur boites partagees et licences applicatives.
+    delegations sur boites aux lettres et licences applicatives.
 
 .DESCRIPTION
-    Version 5.0 - toutes les analyses sont CIBLEES et SILENCIEUSES :
+    Version 5.1 - analyses CIBLEES, VISIBLES et ACCELEREES :
       - seuls les UPN trouves dans AD sont analyses dans Exchange, et seuls
-        ceux qui ont un objet Exchange sont recherches dans les DL et les BAL
-        partagees. Si aucun utilisateur n'est concerne, le scan est saute (la
+        ceux qui ont un objet Exchange sont recherches dans les DL et les
+        delegations. Si aucun utilisateur n'est concerne, le scan est saute (la
         connexion Exchange Online elle-meme n'est ouverte que si necessaire) ;
-      - les DL d'un utilisateur sont obtenues par un filtre serveur
-        (Members -eq <DN>) : plus d'inventaire de toutes les DL du tenant ;
-      - le parcours des BAL partagees n'affiche rien, sauf quand un
-        utilisateur demande y est delegue. Les BAL illisibles sont resumees
-        en une seule ligne a la fin.
+      - DL, SendAs et SendOnBehalf : un appel serveur par utilisateur
+        (Members -eq <DN>, Get-RecipientPermission -Trustee,
+        GrantSendOnBehalfTo -eq <DN>), quel que soit le nombre de boites ;
+      - FullAccess : un appel par boite (aucune recherche inverse n'existe),
+        accelere par un cache local et par le choix automatique de la cmdlet
+        la plus rapide. Les boites ou un utilisateur est trouve sont toujours
+        relues en direct ;
+      - les boites aux lettres accessibles sont listees par utilisateur.
 
-    Ordre d'execution : delegations BAL, DL, groupes AD, puis desactivation.
+    Ordre d'execution : delegations, DL, groupes AD, puis desactivation.
     La desactivation n'a lieu que si les etapes precedentes ont reussi (voir
     $DisableAccountOnPartialFailure) : un echec partiel laisse un compte
     actif et rejouable.
@@ -32,14 +35,17 @@
 .PARAMETER ExportRoot
     Dossier du rapport CSV.
 
-.PARAMETER ShowProgress
-    Affiche les barres de progression des analyses (masquees par defaut).
+.PARAMETER Silent
+    Masque les barres de progression (affichees par defaut).
+
+.PARAMETER RefreshCache
+    Ignore le cache FullAccess et relit toutes les boites (et refait le calibrage).
 
 .EXAMPLE
     .\Offboarding-Audit.ps1 -InputFile C:\Temp\departs.csv -WhatIf
 
 .NOTES
-    Version    : 5.0
+    Version    : 5.1
     Prerequis  : ActiveDirectory, ExchangeOnlineManagement v2+
     Compatible : Windows PowerShell 5.1
 #>
@@ -49,20 +55,28 @@ param(
     [string[]]$UserPrincipalName,
     [string]$InputFile,
     [string]$ExportRoot = 'C:\Temp\AD\Logs\AD+DL',
-    [switch]$ShowProgress
+    [switch]$Silent,
+    [switch]$RefreshCache
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
-if (-not $ShowProgress) { $ProgressPreference = 'SilentlyContinue' }
+if ($Silent) { $ProgressPreference = 'SilentlyContinue' }
 
 # ====================================================================
 # CONFIGURATION
 # ====================================================================
 $ScanInboxRules                 = $true
-$ScanSharedMailboxPermissions   = $true
-$SharedMailboxPermissionTypes   = @('FullAccess', 'SendAs', 'SendOnBehalf')
+$ScanMailboxDelegations         = $true
+$DelegationTypes                = @('FullAccess', 'SendAs', 'SendOnBehalf')
 $DisableAccountOnPartialFailure = $false
+
+# FullAccess exige un appel par boite : ajouter 'RoomMailbox', 'EquipmentMailbox'
+# ou 'UserMailbox' elargit la recherche mais allonge d'autant la premiere analyse.
+# (SendAs et SendOnBehalf couvrent deja tous les types de boites.)
+$FullAccessMailboxTypes         = @('SharedMailbox')
+$FullAccessCmdlet               = 'Auto'   # ou 'Get-EXOMailboxPermission' / 'Get-MailboxPermission'
+$FullAccessCacheHours           = 24       # 0 = pas de cache ; -RefreshCache force une relecture
 
 $ADChunkSize                    = 100
 $BulkMailboxThreshold           = 300   # au-dela, un seul Get-EXOMailbox pour tout le tenant
@@ -71,6 +85,8 @@ $MaxRetries                     = 3
 $RetryBaseDelayMs               = 2000
 
 $TargetSecurityGroupName        = 'GrpSecu-Utilisateurs_POWERPDF'
+$FullAccessCachePath            = Join-Path $ExportRoot 'Cache_FullAccess.clixml'
+$script:FullAccessCache         = $null
 
 $ProtectedGroupPatterns         = @(
     ',CN=Builtin,',
@@ -175,9 +191,16 @@ function Invoke-WithRetry {
     }
 }
 
+# Write-Progress est couteux sous Windows PowerShell 5.1 : 4 rafraichissements
+# par seconde au plus, sinon l'affichage ralentit lui-meme l'analyse.
+$script:ProgressClock  = [Diagnostics.Stopwatch]::StartNew()
+$script:LastProgressMs = -1000
 function Write-ScanProgress {
     param([string]$Activity, [int]$Current, [int]$Total, [Diagnostics.Stopwatch]$Stopwatch, [string]$CurrentItem = '')
     if ($ProgressPreference -eq 'SilentlyContinue' -or $Total -le 0) { return }
+    $now = $script:ProgressClock.ElapsedMilliseconds
+    if ($Current -gt 1 -and $Current -lt $Total -and $now - $script:LastProgressMs -lt 250) { return }
+    $script:LastProgressMs = $now
     $status = "$Current / $Total"
     # $Current est l'element en cours : $Current - 1 sont termines.
     if ($Current -gt 1 -and $Current -lt $Total) {
@@ -186,6 +209,11 @@ function Write-ScanProgress {
     }
     if ($CurrentItem) { $status += " - $CurrentItem" }
     Write-Progress -Activity $Activity -Status $status -PercentComplete ([math]::Min(100, $Current * 100 / $Total))
+}
+
+function Format-Duration {
+    param([TimeSpan]$Elapsed)
+    return '{0:00}:{1:00}' -f [math]::Floor($Elapsed.TotalMinutes), $Elapsed.Seconds
 }
 
 function Read-Choice {
@@ -256,9 +284,9 @@ function New-WorkItem {
         Addresses                        = @($Upn.ToLowerInvariant())
         InboxRuleFindings                = @()
         DLEntries                        = @()
-        SharedMailboxPermissions         = @()
-        SharedMailboxPermissionsToRemove = @()
-        SharedMailboxDecision            = ''
+        Delegations                      = @()
+        DelegationsToRemove              = @()
+        DelegationDecision               = ''
         Licenses                         = @()
         Anomalies                        = @()
         Errors                           = @()
@@ -408,22 +436,26 @@ function Find-UserDistributionGroups {
 }
 
 # ====================================================================
-# BAL PARTAGEES : RECHERCHE CIBLEE ET SILENCIEUSE
+# DELEGATIONS SUR LES BOITES AUX LETTRES
 # ====================================================================
+#   - SendAs       : Get-RecipientPermission -Trustee, UN appel par utilisateur ;
+#   - SendOnBehalf : filtre serveur GrantSendOnBehalfTo -eq <DN>, UN appel par utilisateur ;
+#   - FullAccess   : pas de recherche inverse cote Exchange, donc un appel par
+#                    boite, accelere par un cache local et par le choix
+#                    automatique de la cmdlet la plus rapide sur le tenant.
 
 <#
     Index inverse des identites des SEULS utilisateurs traites : cle normalisee
-    -> cles des work items. Formes sous lesquelles Exchange renvoie un delegue :
-      - FullAccess (User) et SendAs (Trustee) : UPN, SMTP, ou DOMAINE\sam
-      - SendOnBehalf : Name / Identity, ou nom canonique .../Name
-    DisplayName est exclu : non unique, il produisait des faux positifs.
+    -> cles des work items, pour reconnaitre le champ User d'une ACE FullAccess
+    (UPN, SMTP, DOMAINE\sam, Name, DN...). DisplayName est exclu : non unique,
+    il produisait des faux positifs.
 #>
 function New-TargetIdentityIndex {
     param([Parameter(Mandatory)][object[]]$Items)
     $index = @{}
     foreach ($it in $Items) {
         $raw = @($it.UPN) + @($it.Addresses) + @(Get-Prop $it.ADUser 'SamAccountName')
-        foreach ($p in 'UserPrincipalName', 'Alias', 'Name', 'Identity', 'DistinguishedName', 'Guid', 'ExternalDirectoryObjectId') {
+        foreach ($p in 'UserPrincipalName', 'Alias', 'Name', 'Identity', 'Id', 'DistinguishedName', 'Guid', 'ExternalDirectoryObjectId') {
             $raw += "$(Get-Prop $it.Recipient $p)"
         }
         foreach ($value in $raw) {
@@ -451,76 +483,259 @@ function Find-TargetKeys {
     }
 }
 
-function Add-SharedMailboxDelegation {
-    param([Parameter(Mandatory)]$Item, [Parameter(Mandatory)]$Mailbox, [string]$MailboxId, [string]$Type)
-    if (@($Item.SharedMailboxPermissions | Where-Object { $_.MailboxId -eq $MailboxId -and $_.PermissionType -eq $Type }).Count) { return }
-    $Item.SharedMailboxPermissions += [pscustomobject]@{
-        MailboxId          = $MailboxId
-        MailboxDisplayName = "$($Mailbox.DisplayName)"
-        PermissionType     = $Type
+# Reference d'affichage et de retrait d'une boite (ou de tout destinataire).
+function ConvertTo-MailboxRef {
+    param($Recipient)
+    $id = "$(Get-Prop $Recipient 'PrimarySmtpAddress')"
+    if (-not $id) { $id = "$(Get-Prop $Recipient 'Identity')" }
+    [pscustomobject]@{
+        MailboxId   = $id
+        DisplayName = "$(Get-Prop $Recipient 'DisplayName')"
+        Type        = "$(Get-Prop $Recipient 'RecipientTypeDetails')"
     }
-    # Seule sortie du scan : un utilisateur demande est concerne.
-    Write-Host ("  [!] {0} : {1} sur '{2}' <{3}>" -f $Item.UPN, $Type, $Mailbox.DisplayName, $MailboxId) -ForegroundColor Red
 }
 
-# Renvoie la liste des lectures en echec (vide si le scan est complet).
-function Find-SharedMailboxDelegations {
-    param([Parameter(Mandatory)][object[]]$Items, [Parameter(Mandatory)][object[]]$SharedMailboxes)
+function Format-MailboxLabel {
+    param([Parameter(Mandatory)]$Delegation)
+    $label = "$($Delegation.MailboxDisplayName) <$($Delegation.MailboxId)>"
+    if ($Delegation.MailboxType) { $label += " [$($Delegation.MailboxType)]" }
+    return $label
+}
 
-    $byKey = @{}
-    foreach ($it in $Items) { $byKey[$it.Key] = $it }
-    $index    = New-TargetIdentityIndex $Items
+function Add-Delegation {
+    param([Parameter(Mandatory)]$Item, [Parameter(Mandatory)]$Mailbox, [Parameter(Mandatory)][string]$Type, [string]$CacheKey = '')
+    if (-not $Mailbox.MailboxId -or $Mailbox.MailboxId -eq $Item.ExchangeId) { return }   # sa propre boite
+    if (@($Item.Delegations | Where-Object { $_.MailboxId -eq $Mailbox.MailboxId -and $_.PermissionType -eq $Type }).Count) { return }
+    $Item.Delegations += [pscustomobject]@{
+        MailboxId          = $Mailbox.MailboxId
+        MailboxDisplayName = $Mailbox.DisplayName
+        MailboxType        = $Mailbox.Type
+        PermissionType     = $Type
+        CacheKey           = $CacheKey
+    }
+}
+
+# Identite renvoyee par Get-RecipientPermission (souvent le Name) -> reference.
+# $Lookup memorise les resolutions : un seul Get-Recipient par destinataire.
+function Resolve-RecipientRef {
+    param([string]$Identity, [Parameter(Mandatory)][hashtable]$Lookup)
+    $k = ConvertTo-IdentityKey $Identity
+    if (-not $k) { return $null }   # une identite vide renverrait TOUS les destinataires
+    if (-not $Lookup.ContainsKey($k)) {
+        try { $Lookup[$k] = ConvertTo-MailboxRef (@(Invoke-WithRetry { Get-Recipient -Identity $Identity -ErrorAction Stop -WarningAction SilentlyContinue })[0]) }
+        catch { $Lookup[$k] = [pscustomobject]@{ MailboxId = $Identity; DisplayName = $Identity; Type = '' } }
+    }
+    return $Lookup[$k]
+}
+
+function Find-SendAsDelegations {
+    param([Parameter(Mandatory)][object[]]$Items, [Parameter(Mandatory)][hashtable]$Lookup)
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    for ($i = 0; $i -lt $Items.Count; $i++) {
+        $it = $Items[$i]
+        Write-ScanProgress 'SendAs' ($i + 1) $Items.Count $sw $it.UPN
+        try {
+            foreach ($ace in @(Invoke-WithRetry { Get-RecipientPermission -Trustee $it.ExchangeId -ResultSize Unlimited -ErrorAction Stop -WarningAction SilentlyContinue })) {
+                if ((Get-Prop $ace 'IsInherited') -or "$(Get-Prop $ace 'AccessControlType')" -eq 'Deny') { continue }
+                if ((@(Get-Prop $ace 'AccessRights') -join ',') -notmatch 'SendAs') { continue }
+                $ref = Resolve-RecipientRef "$(Get-Prop $ace 'Identity')" $Lookup
+                if ($ref) { Add-Delegation $it $ref 'SendAs' }
+            }
+        }
+        catch { $it.Anomalies += "[!] Lecture SendAs impossible : $($_.Exception.Message)" }
+    }
+    Write-Progress -Activity 'SendAs' -Completed
+}
+
+function Find-SendOnBehalfDelegations {
+    param([Parameter(Mandatory)][object[]]$Items)
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    for ($i = 0; $i -lt $Items.Count; $i++) {
+        $it = $Items[$i]
+        Write-ScanProgress 'SendOnBehalf' ($i + 1) $Items.Count $sw $it.UPN
+        $dn = "$(Get-Prop $it.Recipient 'DistinguishedName')"
+        if (-not $dn) { continue }   # deja signale par la phase DL
+        $filter = "GrantSendOnBehalfTo -eq '{0}'" -f ($dn -replace "'", "''")
+        try {
+            foreach ($mb in @(Invoke-WithRetry { Get-Mailbox -Filter $filter -ResultSize Unlimited -ErrorAction Stop -WarningAction SilentlyContinue })) {
+                Add-Delegation $it (ConvertTo-MailboxRef $mb) 'SendOnBehalf'
+            }
+        }
+        catch { $it.Anomalies += "[!] Lecture SendOnBehalf impossible : $($_.Exception.Message)" }
+    }
+    Write-Progress -Activity 'SendOnBehalf' -Completed
+}
+
+# ---------- FullAccess : cache local -------------------------------
+
+function Get-MailboxCacheKey {
+    param([Parameter(Mandatory)]$Mailbox)
+    foreach ($p in 'ExternalDirectoryObjectId', 'Guid', 'PrimarySmtpAddress') {
+        $v = "$(Get-Prop $Mailbox $p)"
+        if ($v) { return $v.ToLowerInvariant() }
+    }
+    return "$(Get-Prop $Mailbox 'DisplayName')".ToLowerInvariant()
+}
+
+function Import-FullAccessCache {
+    $empty = @{ Version = 1; Cmdlet = ''; Mailboxes = @{} }
+    if ($FullAccessCacheHours -le 0 -or $RefreshCache -or -not (Test-Path -LiteralPath $FullAccessCachePath)) { return $empty }
+    try {
+        $c = Import-Clixml -LiteralPath $FullAccessCachePath
+        if ($c -is [hashtable] -and $c['Version'] -eq 1 -and $c['Mailboxes'] -is [hashtable]) { return $c }
+    }
+    catch { Write-Warning "Cache FullAccess illisible, reconstruction : $($_.Exception.Message)" }
+    return $empty
+}
+
+function Save-FullAccessCache {
+    if ($FullAccessCacheHours -le 0 -or $null -eq $script:FullAccessCache) { return }
+    try { Export-Clixml -InputObject $script:FullAccessCache -LiteralPath $FullAccessCachePath -WhatIf:$false }
+    catch { Write-Warning "Cache FullAccess non enregistre : $($_.Exception.Message)" }
+}
+
+function Get-FullAccessAce {
+    param([Parameter(Mandatory)][string]$Cmdlet, [string]$Identity)
+    # Une identite vide renverrait les permissions de TOUTES les boites.
+    if ([string]::IsNullOrWhiteSpace($Identity)) { throw 'Identite de boite vide.' }
+    if ($Cmdlet -eq 'Get-MailboxPermission') { Get-MailboxPermission -Identity $Identity -ErrorAction Stop -WarningAction SilentlyContinue }
+    else { Get-EXOMailboxPermission -Identity $Identity -ErrorAction Stop -WarningAction SilentlyContinue }
+}
+
+# Lit les ACE FullAccess explicites des boites indiquees et met le cache a jour.
+# Sans cmdlet imposee, les 6 premieres boites alternent les deux cmdlets et la
+# plus rapide (mediane) est retenue pour la suite, puis memorisee dans le cache.
+function Update-FullAccessCache {
+    param([object[]]$Mailboxes)
     $failures = @()
-    $sw       = [Diagnostics.Stopwatch]::StartNew()
+    if (-not @($Mailboxes).Count) { return }
+    $cache   = $script:FullAccessCache
+    $cmdlets = @('Get-EXOMailboxPermission', 'Get-MailboxPermission')
+    $chosen  = if ($FullAccessCmdlet -ne 'Auto') { $FullAccessCmdlet }
+               elseif ($cache.Cmdlet) { $cache.Cmdlet }
+               elseif ($Mailboxes.Count -lt 20) { $cmdlets[0] }
+               else { '' }
+    $timings = @{ $cmdlets[0] = @(); $cmdlets[1] = @() }
+    $sw      = [Diagnostics.Stopwatch]::StartNew()
 
-    for ($i = 0; $i -lt $SharedMailboxes.Count; $i++) {
-        $mb = $SharedMailboxes[$i]
-        Write-ScanProgress 'BAL partagees' ($i + 1) $SharedMailboxes.Count $sw $mb.DisplayName
-        $mbId = "$(Get-Prop $mb 'PrimarySmtpAddress')"
-        if (-not $mbId) { $mbId = "$($mb.Identity)" }
+    for ($i = 0; $i -lt $Mailboxes.Count; $i++) {
+        $mb = $Mailboxes[$i]
+        Write-ScanProgress 'FullAccess' ($i + 1) $Mailboxes.Count $sw $mb.DisplayName
+        $mbId = "$(Get-Prop $mb 'UserPrincipalName')"   # identite la plus rapide selon la doc Microsoft
+        if (-not $mbId) { $mbId = "$(Get-Prop $mb 'PrimarySmtpAddress')" }
 
-        if ($SharedMailboxPermissionTypes -contains 'FullAccess') {
-            try {
-                foreach ($ace in @(Invoke-WithRetry { Get-EXOMailboxPermission -Identity $mbId -ErrorAction Stop -WarningAction SilentlyContinue })) {
-                    if ((Get-Prop $ace 'IsInherited') -or (Get-Prop $ace 'Deny')) { continue }
-                    if ((@(Get-Prop $ace 'AccessRights') -join ',') -notmatch 'FullAccess') { continue }
-                    foreach ($k in @(Find-TargetKeys (Get-Prop $ace 'User') $index)) { Add-SharedMailboxDelegation $byKey[$k] $mb $mbId 'FullAccess' }
-                }
-            }
-            catch { $failures += "$($mb.DisplayName) [FullAccess] : $($_.Exception.Message)" }
+        $order = if ($chosen) { @($chosen) } elseif ($i % 2) { @($cmdlets[1], $cmdlets[0]) } else { $cmdlets }
+        $aces = $null; $lastError = ''
+        foreach ($cmd in $order) {
+            $t = [Diagnostics.Stopwatch]::StartNew()
+            try { $aces = @(Invoke-WithRetry { Get-FullAccessAce $cmd $mbId }); $timings[$cmd] += $t.Elapsed.TotalSeconds; break }
+            catch { $timings[$cmd] += 1e6; $lastError = $_.Exception.Message }
+        }
+        if ($null -eq $aces) { $failures += "$($mb.DisplayName) : $lastError"; continue }
+
+        $ref = ConvertTo-MailboxRef $mb
+        $cache.Mailboxes[(Get-MailboxCacheKey $mb)] = [pscustomobject]@{
+            MailboxId   = $ref.MailboxId
+            DisplayName = $ref.DisplayName
+            Type        = $ref.Type
+            ScannedUtc  = (Get-Date).ToUniversalTime()
+            Users       = @($aces | Where-Object {
+                                -not (Get-Prop $_ 'IsInherited') -and -not (Get-Prop $_ 'Deny') -and
+                                (@(Get-Prop $_ 'AccessRights') -join ',') -match 'FullAccess' } |
+                            ForEach-Object { "$(Get-Prop $_ 'User')" } |
+                            Where-Object { $_ -and $_ -notmatch '^NT AUTHORITY\\|^S-1-5-' })
         }
 
-        if ($SharedMailboxPermissionTypes -contains 'SendAs') {
-            try {
-                foreach ($ace in @(Invoke-WithRetry { Get-EXORecipientPermission -Identity $mbId -ErrorAction Stop -WarningAction SilentlyContinue })) {
-                    if ((Get-Prop $ace 'IsInherited') -or "$(Get-Prop $ace 'AccessControlType')" -eq 'Deny') { continue }
-                    if ((@(Get-Prop $ace 'AccessRights') -join ',') -notmatch 'SendAs') { continue }
-                    foreach ($k in @(Find-TargetKeys (Get-Prop $ace 'Trustee') $index)) { Add-SharedMailboxDelegation $byKey[$k] $mb $mbId 'SendAs' }
-                }
-            }
-            catch { $failures += "$($mb.DisplayName) [SendAs] : $($_.Exception.Message)" }
-        }
-
-        if ($SharedMailboxPermissionTypes -contains 'SendOnBehalf') {
-            # GrantSendOnBehalfTo est deja porte par l'objet : aucun appel supplementaire.
-            foreach ($d in @(Get-PropValues $mb 'GrantSendOnBehalfTo')) {
-                foreach ($k in @(Find-TargetKeys $d $index)) { Add-SharedMailboxDelegation $byKey[$k] $mb $mbId 'SendOnBehalf' }
-            }
+        if (-not $chosen -and $i -ge 5) {
+            $median = @{}
+            foreach ($c in $cmdlets) { $v = @($timings[$c] | Sort-Object); $median[$c] = $v[[int][math]::Floor($v.Count / 2)] }
+            $chosen = if ($median[$cmdlets[1]] -lt $median[$cmdlets[0]]) { $cmdlets[1] } else { $cmdlets[0] }
+            $other  = @($cmdlets | Where-Object { $_ -ne $chosen })[0]
+            $cache.Cmdlet = $chosen
+            $detail = if ($median[$other] -ge 1e5) { "$other en echec" } else { '{0:N2} s/boite contre {1:N2} s pour {2}' -f $median[$chosen], $median[$other], $other }
+            Write-Host "      FullAccess : $chosen retenue ($detail)" -ForegroundColor Gray
         }
     }
-    Write-Progress -Activity 'BAL partagees' -Completed
-
-    foreach ($it in $Items) {
-        $n = @($it.SharedMailboxPermissions).Count
-        if ($n) {
-            $it.SharedMailboxPermissions = @($it.SharedMailboxPermissions | Sort-Object MailboxDisplayName, PermissionType)
-            $it.Anomalies += "[!] Delegation(s) sur $n BAL partagee(s)"
-        }
-    }
+    Write-Progress -Activity 'FullAccess' -Completed
     return $failures
 }
 
-function Remove-SharedMailboxDelegation {
+function Get-FullAccessHits {
+    param([Parameter(Mandatory)][hashtable]$Index)
+    $entries = $script:FullAccessCache.Mailboxes
+    foreach ($key in @($entries.Keys)) {
+        foreach ($u in @($entries[$key].Users)) {
+            foreach ($k in @(Find-TargetKeys $u $Index)) { [pscustomobject]@{ CacheKey = $key; ItemKey = $k } }
+        }
+    }
+}
+
+# Renvoie la liste des boites illisibles (vide si l'analyse est complete).
+function Find-FullAccessDelegations {
+    param([Parameter(Mandatory)][object[]]$Items, [Parameter(Mandatory)][hashtable]$ByKey, [Parameter(Mandatory)][hashtable]$Lookup)
+
+    $script:FullAccessCache = Import-FullAccessCache
+    $entries = $script:FullAccessCache.Mailboxes
+    try {
+        $mailboxes = @(Get-EXOMailbox -RecipientTypeDetails $FullAccessMailboxTypes -ResultSize Unlimited -Properties WhenChangedUTC -ErrorAction Stop -WarningAction SilentlyContinue)
+    }
+    catch {
+        # WhenChangedUTC indisponible : le cache ne se fie alors qu'a son age.
+        $mailboxes = @(Get-EXOMailbox -RecipientTypeDetails $FullAccessMailboxTypes -ResultSize Unlimited -ErrorAction Stop -WarningAction SilentlyContinue)
+    }
+
+    # A relire : boites absentes du cache, modifiees depuis, ou analysees il y a trop longtemps.
+    $maxAge = (Get-Date).ToUniversalTime().AddHours(-$FullAccessCacheHours)
+    $byCacheKey = @{}; $toScan = @()
+    foreach ($mb in $mailboxes) {
+        $key = Get-MailboxCacheKey $mb
+        $byCacheKey[$key] = $mb
+        $ref = ConvertTo-MailboxRef $mb
+        foreach ($p in 'Name', 'Identity', 'Id', 'Alias', 'UserPrincipalName', 'PrimarySmtpAddress', 'DistinguishedName', 'Guid', 'ExternalDirectoryObjectId') {
+            $v = ConvertTo-IdentityKey "$(Get-Prop $mb $p)"
+            if ($v) { $Lookup[$v] = $ref }   # evite un Get-Recipient par resultat SendAs
+        }
+        $entry   = if ($entries.ContainsKey($key)) { $entries[$key] } else { $null }
+        $changed = Get-Prop $mb 'WhenChangedUTC'
+        if (-not $entry -or $entry.ScannedUtc -lt $maxAge -or ($changed -is [datetime] -and $changed -gt $entry.ScannedUtc)) { $toScan += $mb }
+    }
+    foreach ($key in @($entries.Keys)) { if (-not $byCacheKey.ContainsKey($key)) { $entries.Remove($key) } }   # boites supprimees
+
+    Write-Host ("      FullAccess : {0} boite(s) [{1}] - {2} a analyser, {3} depuis le cache" -f
+        $mailboxes.Count, ($FullAccessMailboxTypes -join ', '), $toScan.Count, ($mailboxes.Count - $toScan.Count)) -ForegroundColor Gray
+    $failures = @(Update-FullAccessCache $toScan)
+
+    # Une boite trouvee dans le cache est relue en direct : jamais de resultat perime affiche.
+    $index   = New-TargetIdentityIndex $Items
+    $scanned = @{}; foreach ($mb in $toScan) { $scanned[(Get-MailboxCacheKey $mb)] = $true }
+    $recheck = @(Get-FullAccessHits $index | ForEach-Object { $_.CacheKey } | Sort-Object -Unique |
+                 Where-Object { -not $scanned.ContainsKey($_) } | ForEach-Object { $byCacheKey[$_] })
+    if ($recheck.Count) { $failures += @(Update-FullAccessCache $recheck) }
+
+    foreach ($hit in @(Get-FullAccessHits $index)) {
+        $e = $entries[$hit.CacheKey]
+        Add-Delegation $ByKey[$hit.ItemKey] ([pscustomobject]@{ MailboxId = $e.MailboxId; DisplayName = $e.DisplayName; Type = $e.Type }) 'FullAccess' $hit.CacheKey
+    }
+    Save-FullAccessCache
+    return $failures
+}
+
+function Show-DelegationReport {
+    param([Parameter(Mandatory)][object[]]$Items)
+    Write-Host "`n============ BOITES AUX LETTRES ACCESSIBLES ============" -ForegroundColor Cyan
+    $none = @()
+    foreach ($it in $Items) {
+        $groups = @(@($it.Delegations) | Group-Object MailboxId)
+        if (-not $groups.Count) { $none += $it.UPN; continue }
+        Write-Host ("{0} : {1} boite(s)" -f $it.UPN, $groups.Count) -ForegroundColor Red
+        foreach ($g in $groups) {
+            Write-Host ("  - {0} : {1}" -f (Format-MailboxLabel $g.Group[0]), (@($g.Group | ForEach-Object { $_.PermissionType }) -join ', ')) -ForegroundColor Red
+        }
+    }
+    if ($none.Count) { Write-Host "Aucune delegation : $($none -join ', ')" -ForegroundColor Green }
+}
+
+function Remove-MailboxDelegation {
     param([Parameter(Mandatory)]$Permission, [Parameter(Mandatory)][string]$UserIdentity)
     switch ($Permission.PermissionType) {
         'FullAccess' {
@@ -637,25 +852,25 @@ function Show-UserSummary {
     }
 
     $idx = 0
-    foreach ($p in @($Item.SharedMailboxPermissions)) {
-        if ($idx -eq 0) { Write-Host '[BAL partagees]' -ForegroundColor Red }
+    foreach ($p in @($Item.Delegations)) {
+        if ($idx -eq 0) { Write-Host '[Boites aux lettres accessibles]' -ForegroundColor Red }
         $idx++
-        Write-Host ("  {0}. {1} <{2}> : {3}" -f $idx, $p.MailboxDisplayName, $p.MailboxId, $p.PermissionType) -ForegroundColor Red
+        Write-Host ("  {0}. {1} : {2}" -f $idx, (Format-MailboxLabel $p), $p.PermissionType) -ForegroundColor Red
     }
 
     foreach ($a in @($Item.Anomalies)) { Write-Host "  $a" -ForegroundColor Yellow }
 }
 
-function Select-SharedMailboxRemoval {
+function Select-DelegationRemoval {
     param([Parameter(Mandatory)]$Item)
-    $all = @($Item.SharedMailboxPermissions)
-    $d = Read-Choice "Retirer les $($all.Count) delegation(s) BAL de $($Item.UPN) ? (O = toutes / N = aucune / D = au cas par cas)" 'O', 'N', 'D'
-    $Item.SharedMailboxDecision = $d
-    $Item.SharedMailboxPermissionsToRemove = @(switch ($d) {
+    $all = @($Item.Delegations)
+    $d = Read-Choice "Retirer les $($all.Count) delegation(s) de $($Item.UPN) ? (O = toutes / N = aucune / D = au cas par cas)" 'O', 'N', 'D'
+    $Item.DelegationDecision = $d
+    $Item.DelegationsToRemove = @(switch ($d) {
         'O' { $all }
         'D' { $all | Where-Object { (Read-Choice ("  Retirer {0} sur {1} ? (O/N)" -f $_.PermissionType, $_.MailboxDisplayName)) -eq 'O' } }
     })
-    if ($d -eq 'D') { $Item.SharedMailboxDecision = "Detail ($(@($Item.SharedMailboxPermissionsToRemove).Count)/$($all.Count))" }
+    if ($d -eq 'D') { $Item.DelegationDecision = "Detail ($(@($Item.DelegationsToRemove).Count)/$($all.Count))" }
 }
 
 # Une action d'offboarding : -WhatIf / -Confirm, reessais, journal. Ne leve jamais.
@@ -679,15 +894,19 @@ function Invoke-UserOffboarding {
     $id = $User.ExchangeId
     $errorsBefore = @($User.Errors).Count
 
-    # 1. Delegations BAL partagees (uniquement celles selectionnees)
-    $toRemove = @($User.SharedMailboxPermissionsToRemove)
+    # 1. Delegations sur boites aux lettres (uniquement celles selectionnees)
+    $toRemove = @($User.DelegationsToRemove)
     foreach ($perm in $toRemove) {
-        Invoke-OffboardingStep $User ("Retrait {0} sur BAL '{1}'" -f $perm.PermissionType, $perm.MailboxDisplayName) {
-            Remove-SharedMailboxDelegation $perm $id
+        Invoke-OffboardingStep $User ("Retrait {0} sur '{1}'" -f $perm.PermissionType, $perm.MailboxDisplayName) {
+            Remove-MailboxDelegation $perm $id
+        }
+        # Boite relue a la prochaine analyse : le cache ne doit pas survivre au retrait.
+        if ($perm.CacheKey -and -not $WhatIfPreference -and $null -ne $script:FullAccessCache) {
+            $script:FullAccessCache.Mailboxes.Remove($perm.CacheKey)
         }
     }
-    foreach ($perm in @($User.SharedMailboxPermissions | Where-Object { $toRemove -notcontains $_ })) {
-        $User.Journal += "Conservee : $($perm.PermissionType) sur BAL '$($perm.MailboxDisplayName)'"
+    foreach ($perm in @($User.Delegations | Where-Object { $toRemove -notcontains $_ })) {
+        $User.Journal += "Conservee : $($perm.PermissionType) sur '$($perm.MailboxDisplayName)'"
     }
 
     # 2. Listes de distribution
@@ -734,10 +953,10 @@ function Invoke-UserOffboarding {
 
 function ConvertTo-ExportRow {
     param([Parameter(Mandatory)]$Item)
-    $perms  = @($Item.SharedMailboxPermissions)
+    $perms  = @($Item.Delegations)
     $byType = {
         param([string]$Type)
-        Join-Values @($perms | Where-Object { $_.PermissionType -eq $Type } | ForEach-Object { "$($_.MailboxDisplayName) <$($_.MailboxId)>" })
+        Join-Values @($perms | Where-Object { $_.PermissionType -eq $Type } | ForEach-Object { Format-MailboxLabel $_ })
     }
 
     [pscustomobject]@{
@@ -751,13 +970,13 @@ function ConvertTo-ExportRow {
         GroupesAD                 = Join-Values @($Item.ADGroupDNs | ForEach-Object { Get-NameFromDN $_ })
         NbDL                      = @($Item.DLEntries).Count
         DLExchange                = Join-Values @($Item.DLEntries | ForEach-Object { $_.DisplayName })
-        MembreBALPartagee         = $(if ($perms.Count) { 'Oui' } else { 'Non' })
-        NbDelegationsBALPartagees = $perms.Count
+        MembreBAL                 = $(if ($perms.Count) { 'Oui' } else { 'Non' })
+        NbDelegationsBAL          = $perms.Count
         BALFullAccess             = & $byType 'FullAccess'
         BALSendAs                 = & $byType 'SendAs'
         BALSendOnBehalf           = & $byType 'SendOnBehalf'
-        DecisionRetraitBAL        = $Item.SharedMailboxDecision
-        NbBALSelectionnees        = @($Item.SharedMailboxPermissionsToRemove).Count
+        DecisionRetraitBAL        = $Item.DelegationDecision
+        NbBALSelectionnees        = @($Item.DelegationsToRemove).Count
         EstMembrePowerPDF         = $(if ($Item.IsMemberOfPowerPDFGroup) { 'Oui' } else { 'Non' })
         Licences                  = Join-Values $Item.Licenses
         Anomalies                 = Join-Values $Item.Anomalies
@@ -828,42 +1047,72 @@ try {
             try { $connected = [bool]@(Get-ConnectionInformation | Where-Object { "$($_.State)" -eq 'Connected' }).Count } catch { $connected = $false }
         }
         if (-not $connected) {
-            try { Connect-ExchangeOnline -ShowBanner:$false | Out-Null; $exoConnectedHere = $true }
+            $connectArgs = @{ ShowBanner = $false }
+            # Connexion plus rapide (V3) : les formats d'affichage Exchange ne sont pas utilises.
+            if ((Get-Command Connect-ExchangeOnline).Parameters.ContainsKey('SkipLoadingFormatData')) { $connectArgs.SkipLoadingFormatData = $true }
+            try { Connect-ExchangeOnline @connectArgs | Out-Null; $exoConnectedHere = $true }
             catch { throw "Connexion Exchange Online impossible : $($_.Exception.Message)" }
         }
 
+        Write-Host '[2/5] Exchange : boites aux lettres et regles Inbox...' -ForegroundColor Yellow
+        $phase = [Diagnostics.Stopwatch]::StartNew()
         Resolve-ExchangeRecipients $adItems
         $exoItems = @($adItems | Where-Object { $_.Recipient })
-        Write-Host ("[2/5] Exchange : {0} destinataire(s), dont {1} boite(s) aux lettres" -f $exoItems.Count, @($exoItems | Where-Object { $_.Mailbox }).Count) -ForegroundColor Yellow
+        Write-Host ("      {0} destinataire(s), dont {1} boite(s) aux lettres ({2})" -f
+            $exoItems.Count, @($exoItems | Where-Object { $_.Mailbox }).Count, (Format-Duration $phase.Elapsed)) -ForegroundColor Gray
 
         # ---------------- 3. LISTES DE DISTRIBUTION -----------------
         if ($exoItems.Count) {
+            Write-Host '[3/5] Listes de distribution...' -ForegroundColor Yellow
+            $phase = [Diagnostics.Stopwatch]::StartNew()
             Find-UserDistributionGroups $exoItems
             $nbDL = 0; foreach ($it in $exoItems) { $nbDL += @($it.DLEntries).Count }
-            Write-Host "[3/5] Listes de distribution : $nbDL appartenance(s)" -ForegroundColor Yellow
+            Write-Host "      $nbDL appartenance(s) ($(Format-Duration $phase.Elapsed))" -ForegroundColor Gray
         }
         else { Write-Host '[3/5] Listes de distribution : aucun utilisateur concerne, ignore' -ForegroundColor Gray }
 
-        # ---------------- 4. BAL PARTAGEES --------------------------
-        if (-not $ScanSharedMailboxPermissions) { Write-Host '[4/5] BAL partagees : desactive' -ForegroundColor Gray }
-        elseif (-not $exoItems.Count) { Write-Host '[4/5] BAL partagees : aucun utilisateur concerne, ignore' -ForegroundColor Gray }
+        # ---------------- 4. DELEGATIONS SUR BOITES AUX LETTRES -----
+        if (-not $ScanMailboxDelegations) { Write-Host '[4/5] Delegations : desactive' -ForegroundColor Gray }
+        elseif (-not $exoItems.Count) { Write-Host '[4/5] Delegations : aucun utilisateur concerne, ignore' -ForegroundColor Gray }
         else {
-            try {
-                $shared = @(Get-EXOMailbox -RecipientTypeDetails SharedMailbox -ResultSize Unlimited `
-                            -Properties GrantSendOnBehalfTo -ErrorAction Stop -WarningAction SilentlyContinue)
-                Write-Host "[4/5] BAL partagees : analyse silencieuse de $($shared.Count) BAL..." -ForegroundColor Yellow
-                $failures = @(Find-SharedMailboxDelegations -Items $exoItems -SharedMailboxes $shared)
+            Write-Host '[4/5] Delegations sur les boites aux lettres...' -ForegroundColor Yellow
+            $byKey = @{}; foreach ($it in $exoItems) { $byKey[$it.Key] = $it }
+            $lookup = @{}
 
-                $concernes = @($exoItems | Where-Object { @($_.SharedMailboxPermissions).Count })
-                if ($concernes.Count) { Write-Host "      $($concernes.Count) utilisateur(s) delegue(s) sur au moins une BAL partagee" -ForegroundColor Red }
-                else { Write-Host '      Aucune delegation pour les utilisateurs demandes' -ForegroundColor Green }
+            if ($DelegationTypes -contains 'FullAccess') {
+                $phase = [Diagnostics.Stopwatch]::StartNew()
+                try {
+                    $failures = @(Find-FullAccessDelegations -Items $exoItems -ByKey $byKey -Lookup $lookup)
+                    if ($failures.Count) {
+                        Write-Warning ("{0} boite(s) illisible(s), FullAccess possiblement incomplet : {1}" -f $failures.Count, (@($failures | Select-Object -First 5) -join ' ; '))
+                        $failures | ForEach-Object { Write-Verbose $_ }
+                    }
+                }
+                catch {
+                    Write-Warning "Analyse FullAccess impossible : $($_.Exception.Message)"
+                    foreach ($it in $exoItems) { $it.Anomalies += '[!] Analyse FullAccess impossible' }
+                }
+                Write-Host "      FullAccess : termine ($(Format-Duration $phase.Elapsed))" -ForegroundColor Gray
+            }
+            if ($DelegationTypes -contains 'SendAs') {
+                $phase = [Diagnostics.Stopwatch]::StartNew()
+                Find-SendAsDelegations -Items $exoItems -Lookup $lookup
+                Write-Host "      SendAs : termine ($(Format-Duration $phase.Elapsed))" -ForegroundColor Gray
+            }
+            if ($DelegationTypes -contains 'SendOnBehalf') {
+                $phase = [Diagnostics.Stopwatch]::StartNew()
+                Find-SendOnBehalfDelegations -Items $exoItems
+                Write-Host "      SendOnBehalf : termine ($(Format-Duration $phase.Elapsed))" -ForegroundColor Gray
+            }
 
-                if ($failures.Count) {
-                    Write-Warning ("{0} lecture(s) de BAL en echec, resultat possiblement incomplet : {1}" -f $failures.Count, (@($failures | Select-Object -First 5) -join ' ; '))
-                    $failures | ForEach-Object { Write-Verbose $_ }
+            foreach ($it in $exoItems) {
+                $n = @(@($it.Delegations) | Group-Object MailboxId).Count
+                if ($n) {
+                    $it.Delegations = @($it.Delegations | Sort-Object MailboxDisplayName, PermissionType)
+                    $it.Anomalies  += "[!] Delegation(s) sur $n boite(s) aux lettres"
                 }
             }
-            catch { Write-Warning "Analyse BAL partagees impossible : $($_.Exception.Message)" }
+            Show-DelegationReport $exoItems
         }
     }
 
@@ -880,7 +1129,7 @@ try {
     Write-Host "[5/5] Licences : $nbLic utilisateur(s) concerne(s)" -ForegroundColor Yellow
 
     # ---------------- REVUE : seulement les utilisateurs concernes ---
-    # La liste numerotee des BAL est affichee une seule fois, dans le resume.
+    # La liste numerotee des delegations sert au choix D (au cas par cas).
     $ready = @()
     foreach ($it in $adItems) {
         if (@($it.Anomalies).Count) {
@@ -889,7 +1138,7 @@ try {
             $it.DateDecision      = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
             if ($it.DecisionAnomalies -ne 'O') { $it.StatutExecution = 'Bloque apres analyse des anomalies'; continue }
         }
-        if (@($it.SharedMailboxPermissions).Count) { Select-SharedMailboxRemoval $it }
+        if (@($it.Delegations).Count) { Select-DelegationRemoval $it }
         $ready += $it
     }
 
@@ -902,10 +1151,10 @@ try {
     if ($ready.Count) {
         $plan = @($ready | ForEach-Object {
             [pscustomobject]@{
-                UPN       = $_.UPN
-                GroupesAD = @($_.ADGroupDNs | Where-Object { -not (Test-IsProtectedGroupDN $_) }).Count
-                DL        = @($_.DLEntries | Where-Object { -not (Get-Prop $_ 'IsDirSynced') }).Count
-                BAL       = '{0}/{1}' -f @($_.SharedMailboxPermissionsToRemove).Count, @($_.SharedMailboxPermissions).Count
+                UPN         = $_.UPN
+                GroupesAD   = @($_.ADGroupDNs | Where-Object { -not (Test-IsProtectedGroupDN $_) }).Count
+                DL          = @($_.DLEntries | Where-Object { -not (Get-Prop $_ 'IsDirSynced') }).Count
+                Delegations = '{0}/{1}' -f @($_.DelegationsToRemove).Count, @($_.Delegations).Count
             }
         })
         $plan | Format-Table -AutoSize | Out-Host
@@ -929,6 +1178,7 @@ try {
         foreach ($e in @($w.Errors)) { Write-Host "      $e" -ForegroundColor Red }
     }
 
+    Save-FullAccessCache
     Write-ExportCsv $items $exportCsvPath
     Write-Host "`n[OK] Traitement termine. Rapport : $exportCsvPath" -ForegroundColor Cyan
 }
